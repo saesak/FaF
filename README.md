@@ -13,6 +13,30 @@ Supports PDF and EPUB files. Built with SvelteKit and deployable as a web app, d
 
 <img width="815" height="804" alt="image" src="https://github.com/user-attachments/assets/c7069e2a-44f2-44df-8024-25df842959d4" />
 
+## How to Use / Keyboard Shortcuts
+
+### Web & Desktop
+
+| Key | Action |
+|-----|--------|
+| `Space` | Play / Pause |
+| `←` | Skip backward |
+| `→` | Skip forward |
+| `[` | Decrease speed (WPM) |
+| `]` | Increase speed (WPM) |
+| `Tab` | Toggle between speed view and reader view |
+
+### Mobile
+
+| Gesture | Action |
+|---------|--------|
+| Tap | Play / Pause |
+| Swipe left/right | Toggle between speed view and reader view |
+| Long press (when paused) | Show speed controls |
+
+## Limitations
+
+- Resuming the same PDF on web is currently not supported. PDFs work fully on desktop and mobile, but web browsers cannot re-access the same file between sessions.
 
 ## Development
 
