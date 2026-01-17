@@ -4,6 +4,16 @@ An RSVP (Rapid Serial Visual Presentation) speed reading app that displays one w
 
 Supports PDF and EPUB files. Built with SvelteKit and deployable as a web app, desktop app (via Tauri), or mobile app (via Capacitor).
 
+## Looks Like This
+
+<img width="494" height="572" alt="image" src="https://github.com/user-attachments/assets/40db38fe-94f3-4f6e-a627-5e4f4f162bec" />
+
+<img width="815" height="804" alt="image" src="https://github.com/user-attachments/assets/0f114488-aeab-4f92-8a7b-767a20012ac5" />
+
+
+<img width="815" height="804" alt="image" src="https://github.com/user-attachments/assets/c7069e2a-44f2-44df-8024-25df842959d4" />
+
+
 ## Development
 
 Install dependencies:
