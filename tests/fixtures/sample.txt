@@ -1,0 +1,7 @@
+The quick brown fox jumps over the lazy dog. This is a sample text file for testing the FaF speed reader application.
+
+Speed reading is a technique that allows you to read faster while maintaining comprehension. The RSVP method displays one word at a time, reducing eye movement and increasing reading speed.
+
+This file contains multiple paragraphs to test paragraph detection and navigation. Each paragraph should be identified correctly by the parser.
+
+The final paragraph tests that we can reach the end of the document and handle the completion state properly.

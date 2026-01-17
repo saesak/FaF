@@ -1,0 +1,37 @@
+:root {
+  /* === User Configurable Colors === */
+  --color-bg: #38393d;
+  --color-text: #ffffff;
+  --color-orp: #e53935;
+
+  /* === Derived Colors (computed from above) === */
+
+  /* Transparent variants */
+  --color-text-90: rgba(255, 255, 255, 0.9);
+  --color-text-80: rgba(255, 255, 255, 0.8);
+  --color-text-60: rgba(255, 255, 255, 0.6);
+  --color-text-50: rgba(255, 255, 255, 0.5);
+  --color-text-40: rgba(255, 255, 255, 0.4);
+  --color-text-30: rgba(255, 255, 255, 0.3);
+  --color-text-20: rgba(255, 255, 255, 0.2);
+  --color-text-10: rgba(255, 255, 255, 0.1);
+  --color-text-05: rgba(255, 255, 255, 0.05);
+
+  /* ORP variants */
+  --color-orp-light: rgba(229, 57, 53, 0.3);
+  --color-orp-bg: rgba(229, 57, 53, 0.2);
+
+  /* Background variants */
+  --color-bg-light: #454650;
+  --color-bg-dark: #2e2f33;
+  --color-bg-overlay: rgba(0, 0, 0, 0.3);
+  --color-bg-overlay-heavy: rgba(0, 0, 0, 0.7);
+
+  /* Semantic colors */
+  --color-error: #e53935;
+  --color-success: #4caf50;
+  --color-warning: #ff9800;
+
+  /* Focus/outline */
+  --color-focus: rgba(229, 57, 53, 0.5);
+}

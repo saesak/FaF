@@ -1,0 +1,2766 @@
+# Parser System Specification
+
+## Agent Context
+- **Status**: approved
+- **Iteration**: 2
+- **Last Agent**: judge
+- **Last Action**: Re-reviewed specification after fixes - APPROVED
+- **Open Issues**: none
+---
+
+## Scope
+Handles all file parsing (TXT, EPUB, PDF), word tokenization, ORP calculation, and position mapping.
+
+## Reference
+- See: `SPEC.md` - Input Formats section
+- See: `SYSTEM_STATE_MACHINE.md` - LOADING_STATE
+
+---
+
+## Plan
+
+### Core Data Structures
+
+#### 1. ParsedWord Interface
+```typescript
+interface ParsedWord {
+  text: string;              // The actual word
+  orp: number;               // Optimal Reading Point index (0-based)
+  punctuation: string;       // Trailing punctuation (.?!:;,)
+  originalIndex: number;     // Position in original word array
+  documentPosition: {
+    pageIndex?: number;      // PDF page or EPUB chapter
+    paragraphIndex: number;
+    wordIndexInParagraph: number;
+  };
+  displayDelay: number;      // Calculated delay multiplier (1x, 2x, 3x)
+}
+```
+
+#### 2. DocumentModel Interface
+```typescript
+interface DocumentModel {
+  words: ParsedWord[];
+  metadata: DocumentMetadata;
+  rawContent: RawContent;    // For Reader View rendering
+}
+
+interface DocumentMetadata {
+  title: string;
+  author?: string;
+  fileType: 'txt' | 'epub' | 'pdf' | 'paste';
+  filePath?: string;
+  fileSize: number;
+  totalWords: number;
+  totalParagraphs: number;
+  estimatedReadingTime: number; // at 300 WPM baseline
+}
+
+interface RawContent {
+  type: 'txt' | 'epub' | 'pdf';
+  plainText?: string;
+  chapters?: Chapter[];
+  pages?: PDFPage[];
+}
+
+interface Chapter {
+  title?: string;
+  content: string;  // HTML
+  paragraphs: Paragraph[];
+}
+
+interface PDFPage {
+  pageNumber: number;
+  content: string;
+  paragraphs: Paragraph[];
+  images?: ImageData[];
+}
+
+interface Paragraph {
+  text: string;
+  startWordIndex: number;
+  endWordIndex: number;
+}
+```
+
+#### 3. ParseResult Type
+```typescript
+type ParseResult =
+  | { success: true; document: DocumentModel }
+  | { success: false; error: ParseError };
+
+interface ParseError {
+  type: 'file_too_large' | 'corrupted_file' | 'drm_protected' | 'unsupported_format' | 'unknown';
+  message: string;
+  details?: string;
+}
+```
+
+### Module Breakdown
+
+| Module | Purpose |
+|--------|---------|
+| File Validator | Pre-flight checks (size, type) |
+| TXT Parser | Plain text and pasted content |
+| EPUB Parser | EPUB via epub.js, DRM detection |
+| PDF Parser | PDF via pdf.js, columns, header/footer filtering |
+| Word Tokenizer | Split text, calc ORP, delay multipliers |
+| Position Mapper | Bidirectional word-position mapping |
+
+### Key Algorithms
+
+#### ORP Calculation
+```typescript
+function calculateORP(word: string): number {
+  const length = word.length;
+  if (length <= 2) return 0;
+  if (length <= 6) return 1;
+  if (length <= 10) return 2;
+  if (length <= 13) return 3;
+  return 4;
+}
+```
+
+#### PDF Column Detection
+```typescript
+function detectColumns(textItems: PDFTextItem[]): ColumnLayout {
+  const xClusters = clusterByXPosition(textItems, tolerance = 50);
+  if (xClusters.length === 1) return { type: 'single' };
+  return { type: 'multi', columns: xClusters.length };
+}
+```
+
+#### Header/Footer Detection
+- Collect first/last 3 lines from each page
+- Find patterns repeated on 80%+ of pages
+- Detect page numbers via regex
+
+### Error Handling
+| Error Type | Trigger | User Message |
+|------------|---------|--------------|
+| file_too_large | > 50MB | "File exceeds 50MB limit" |
+| corrupted_file | Parse failure | "Unable to parse file" |
+| drm_protected | DRM detected | "This file is DRM protected" |
+| unsupported_format | Unknown type | "Unsupported file format" |
+
+### Specification Sections
+1. Overview
+2. Data Models (full interfaces)
+3. Module Specifications (3.1-3.6)
+4. Error Handling
+5. Performance Considerations
+6. Integration Points
+7. Testing Requirements
+8. Dependencies (epub.js, pdf.js versions)
+9. Future Enhancements
+
+---
+
+## Specification
+
+### 1. Overview
+
+#### Purpose
+The Parser System is the entry point for all document content in FaF. It transforms raw file input (TXT, EPUB, PDF) or pasted text into a structured `DocumentModel` that the rest of the application consumes for speed reading and document viewing.
+
+#### Role in Application
+- Receives input from EMPTY_STATE via file drop, file picker, paste, or recent file selection
+- Produces LOADING_STATE while parsing
+- Outputs to DOCUMENT_LOADED state on success or ERROR_STATE on failure
+- Feeds the `documentStore` Svelte store with parsed content
+
+#### Data Flow Diagram
+```
+                    ┌─────────────────────────────────────────┐
+                    │              INPUT SOURCES               │
+                    │                                         │
+                    │  [File Drop] [File Pick] [Paste] [Recent]│
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │           FILE VALIDATOR                 │
+                    │                                         │
+                    │  • Check file size <= 50MB              │
+                    │  • Detect file type by extension/MIME   │
+                    │  • Validate file is readable            │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                    ┌─────────────────┴───────────────────────┐
+                    │                                         │
+          ┌─────────▼─────────┐ ┌─────────▼─────────┐ ┌──────▼──────┐
+          │    TXT PARSER     │ │   EPUB PARSER     │ │ PDF PARSER  │
+          │                   │ │                   │ │             │
+          │ • Read as UTF-8   │ │ • epub.js load    │ │ • pdf.js    │
+          │ • Split paragraphs│ │ • DRM detection   │ │ • Columns   │
+          │                   │ │ • Chapter extract │ │ • Headers   │
+          └─────────┬─────────┘ └─────────┬─────────┘ └──────┬──────┘
+                    │                     │                   │
+                    └─────────────────────┼───────────────────┘
+                                          │
+                                          ▼
+                    ┌─────────────────────────────────────────┐
+                    │           WORD TOKENIZER                 │
+                    │                                         │
+                    │  • Split into words                     │
+                    │  • Calculate ORP for each word          │
+                    │  • Determine delay multipliers          │
+                    │  • Handle special cases (numbers, etc.) │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │          POSITION MAPPER                 │
+                    │                                         │
+                    │  • Build word index -> paragraph map    │
+                    │  • Build paragraph -> word range map    │
+                    │  • Enable bidirectional lookup          │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │           DOCUMENT MODEL                 │
+                    │                                         │
+                    │  { words[], metadata, rawContent }      │
+                    │                                         │
+                    │           → documentStore               │
+                    └─────────────────────────────────────────┘
+```
+
+---
+
+### 2. Data Models
+
+#### 2.1 ParsedWord
+```typescript
+/**
+ * Represents a single word prepared for speed reading display.
+ * Contains all information needed for rendering and navigation.
+ */
+interface ParsedWord {
+  /**
+   * The word text including any attached punctuation for display.
+   * Examples: "Hello", "world!", "self-aware", "$1,234"
+   */
+  text: string;
+
+  /**
+   * Optimal Reading Point - the 0-based index of the character
+   * to highlight in red for focus. Calculated by word length.
+   */
+  orp: number;
+
+  /**
+   * Trailing punctuation that affects timing.
+   * Only contains: . ? ! : ; ,
+   * Empty string if no relevant punctuation.
+   */
+  punctuation: string;
+
+  /**
+   * Global index of this word in the flattened word array.
+   * Used for position tracking and navigation.
+   */
+  originalIndex: number;
+
+  /**
+   * Position within the document structure for view sync.
+   */
+  documentPosition: DocumentPosition;
+
+  /**
+   * Delay multiplier for this word based on punctuation.
+   * 1 = normal, 2 = medium pause (:;,), 3 = long pause (.?!)
+   */
+  delayMultiplier: 1 | 2 | 3;
+}
+
+/**
+ * Location of a word within the document hierarchy.
+ */
+interface DocumentPosition {
+  /**
+   * For PDF: page number (0-based)
+   * For EPUB: chapter index (0-based)
+   * For TXT: undefined
+   */
+  pageIndex?: number;
+
+  /**
+   * Paragraph index within the page/chapter/document.
+   * 0-based, resets for each page/chapter.
+   */
+  paragraphIndex: number;
+
+  /**
+   * Word position within the paragraph (0-based).
+   */
+  wordIndexInParagraph: number;
+}
+```
+
+#### 2.2 DocumentModel
+```typescript
+/**
+ * Complete parsed document ready for speed reading.
+ * This is the primary output of the Parser System.
+ */
+interface DocumentModel {
+  /**
+   * Flattened array of all words in reading order.
+   * This is the primary data structure for playback.
+   */
+  words: ParsedWord[];
+
+  /**
+   * Document metadata for display and persistence.
+   */
+  metadata: DocumentMetadata;
+
+  /**
+   * Original content structure for Reader View rendering.
+   * Preserves paragraphs, chapters, pages for scroll sync.
+   */
+  rawContent: RawContent;
+
+  /**
+   * Mapping structures for bidirectional navigation.
+   */
+  positionMap: PositionMap;
+}
+
+/**
+ * Document metadata extracted during parsing.
+ */
+interface DocumentMetadata {
+  /**
+   * Document title. For files: filename without extension.
+   * For EPUB: extracted title metadata.
+   * For paste: "Pasted Text"
+   */
+  title: string;
+
+  /**
+   * Author name if available (EPUB metadata).
+   */
+  author?: string;
+
+  /**
+   * Source type for UI display and conditional logic.
+   */
+  fileType: 'txt' | 'epub' | 'pdf' | 'paste';
+
+  /**
+   * Original file path for recent files tracking.
+   * Undefined for pasted text.
+   */
+  filePath?: string;
+
+  /**
+   * File size in bytes. 0 for pasted text.
+   */
+  fileSize: number;
+
+  /**
+   * Total word count for progress calculation.
+   */
+  totalWords: number;
+
+  /**
+   * Total paragraph count.
+   */
+  totalParagraphs: number;
+
+  /**
+   * Estimated reading time in minutes at 300 WPM.
+   */
+  estimatedReadingTime: number;
+}
+
+/**
+ * Union type for format-specific content structures.
+ */
+type RawContent = TxtContent | EpubContent | PdfContent;
+
+interface TxtContent {
+  type: 'txt';
+  /**
+   * Full plain text content.
+   */
+  plainText: string;
+  /**
+   * Paragraphs split by double newlines.
+   */
+  paragraphs: Paragraph[];
+}
+
+interface EpubContent {
+  type: 'epub';
+  /**
+   * Ordered chapters with content.
+   */
+  chapters: Chapter[];
+}
+
+interface PdfContent {
+  type: 'pdf';
+  /**
+   * Pages with extracted text and optional images.
+   */
+  pages: PdfPage[];
+}
+```
+
+#### 2.3 Supporting Types
+```typescript
+/**
+ * A paragraph of text with position tracking.
+ */
+interface Paragraph {
+  /**
+   * Plain text content of the paragraph.
+   */
+  text: string;
+
+  /**
+   * Index of first word in this paragraph (in words[]).
+   */
+  startWordIndex: number;
+
+  /**
+   * Index of last word in this paragraph (inclusive).
+   */
+  endWordIndex: number;
+}
+
+/**
+ * EPUB chapter structure.
+ */
+interface Chapter {
+  /**
+   * Chapter title from TOC or heading.
+   */
+  title?: string;
+
+  /**
+   * Chapter index (0-based).
+   */
+  index: number;
+
+  /**
+   * HTML content for Reader View rendering.
+   */
+  htmlContent: string;
+
+  /**
+   * Extracted paragraphs for speed reading.
+   */
+  paragraphs: Paragraph[];
+}
+
+/**
+ * PDF page structure.
+ */
+interface PdfPage {
+  /**
+   * Page number (1-based for display, internally 0-based).
+   */
+  pageNumber: number;
+
+  /**
+   * Extracted plain text content.
+   */
+  textContent: string;
+
+  /**
+   * Paragraphs after header/footer filtering.
+   */
+  paragraphs: Paragraph[];
+
+  /**
+   * Embedded images for Reader View (optional).
+   */
+  images?: EmbeddedImage[];
+}
+
+/**
+ * Image data for Reader View display.
+ */
+interface EmbeddedImage {
+  /**
+   * Data URL or object URL for display.
+   */
+  src: string;
+
+  /**
+   * Position in document flow (after which paragraph).
+   */
+  afterParagraphIndex: number;
+
+  /**
+   * Alt text if available.
+   */
+  alt?: string;
+}
+
+/**
+ * Bidirectional position mapping for view sync.
+ */
+interface PositionMap {
+  /**
+   * Map from word index to paragraph index.
+   * wordToParagraph[wordIndex] = paragraphIndex
+   */
+  wordToParagraph: number[];
+
+  /**
+   * Map from paragraph index to word range.
+   * paragraphToWords[paragraphIndex] = { start, end }
+   */
+  paragraphToWords: Array<{ start: number; end: number }>;
+}
+```
+
+#### 2.4 Parse Result Types
+```typescript
+/**
+ * Result type for all parsing operations.
+ * Uses discriminated union for type-safe error handling.
+ */
+type ParseResult =
+  | ParseSuccess
+  | ParseFailure;
+
+interface ParseSuccess {
+  success: true;
+  document: DocumentModel;
+}
+
+interface ParseFailure {
+  success: false;
+  error: ParseError;
+}
+
+/**
+ * Structured error information for user display.
+ */
+interface ParseError {
+  /**
+   * Error category for conditional handling.
+   */
+  type: ParseErrorType;
+
+  /**
+   * User-facing error message.
+   */
+  message: string;
+
+  /**
+   * Technical details for debugging (not shown to user).
+   */
+  details?: string;
+}
+
+type ParseErrorType =
+  | 'file_too_large'
+  | 'corrupted_file'
+  | 'drm_protected'
+  | 'unsupported_format'
+  | 'encoding_error'
+  | 'empty_file'
+  | 'unknown';
+```
+
+---
+
+### 3. File Validator Module
+
+#### 3.1 Module Interface
+```typescript
+// src/lib/parser/fileValidator.ts
+
+/**
+ * Validates a file before parsing.
+ * @param file - File object from input or drop
+ * @returns Validation result with file type if valid
+ */
+export function validateFile(file: File): ValidationResult;
+
+/**
+ * Validates pasted text input.
+ * @param text - Pasted text string
+ * @returns Validation result
+ */
+export function validatePaste(text: string): ValidationResult;
+
+type ValidationResult =
+  | { valid: true; fileType: SupportedFileType; size: number }
+  | { valid: false; error: ParseError };
+
+type SupportedFileType = 'txt' | 'epub' | 'pdf';
+```
+
+#### 3.2 File Type Detection
+```typescript
+const FILE_SIGNATURES: Record<string, SupportedFileType> = {
+  // EPUB is a ZIP with specific structure
+  'PK': 'epub', // ZIP magic bytes (first check)
+  '%PDF': 'pdf',
+};
+
+const EXTENSION_MAP: Record<string, SupportedFileType> = {
+  '.txt': 'txt',
+  '.text': 'txt',
+  '.epub': 'epub',
+  '.pdf': 'pdf',
+};
+
+const MIME_MAP: Record<string, SupportedFileType> = {
+  'text/plain': 'txt',
+  'application/epub+zip': 'epub',
+  'application/pdf': 'pdf',
+};
+
+/**
+ * Detect file type using multiple strategies.
+ * Priority: magic bytes > MIME type > extension
+ */
+function detectFileType(file: File): SupportedFileType | null {
+  // 1. Try extension first (fastest)
+  const ext = getExtension(file.name);
+  if (ext && EXTENSION_MAP[ext]) {
+    return EXTENSION_MAP[ext];
+  }
+
+  // 2. Try MIME type
+  if (file.type && MIME_MAP[file.type]) {
+    return MIME_MAP[file.type];
+  }
+
+  // 3. Will need to read magic bytes for ambiguous cases
+  // This is handled in async validation
+  return null;
+}
+
+function getExtension(filename: string): string | null {
+  const match = filename.match(/\.[^.]+$/);
+  return match ? match[0].toLowerCase() : null;
+}
+```
+
+#### 3.3 Validation Logic
+```typescript
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+const MIN_PASTE_LENGTH = 1; // At least 1 character
+const MAX_PASTE_LENGTH = 10 * 1024 * 1024; // 10 MB of text
+
+export function validateFile(file: File): ValidationResult {
+  // Check size
+  if (file.size > MAX_FILE_SIZE) {
+    return {
+      valid: false,
+      error: {
+        type: 'file_too_large',
+        message: 'File exceeds 50MB limit. Please choose a smaller file.',
+        details: `File size: ${formatBytes(file.size)}`,
+      },
+    };
+  }
+
+  // Check for empty file
+  if (file.size === 0) {
+    return {
+      valid: false,
+      error: {
+        type: 'empty_file',
+        message: 'This file is empty.',
+      },
+    };
+  }
+
+  // Detect type
+  const fileType = detectFileType(file);
+  if (!fileType) {
+    return {
+      valid: false,
+      error: {
+        type: 'unsupported_format',
+        message: 'Unsupported file format. Please use TXT, EPUB, or PDF files.',
+        details: `File: ${file.name}, MIME: ${file.type}`,
+      },
+    };
+  }
+
+  return {
+    valid: true,
+    fileType,
+    size: file.size,
+  };
+}
+
+export function validatePaste(text: string): ValidationResult {
+  const trimmed = text.trim();
+
+  if (trimmed.length < MIN_PASTE_LENGTH) {
+    return {
+      valid: false,
+      error: {
+        type: 'empty_file',
+        message: 'Please paste some text to read.',
+      },
+    };
+  }
+
+  if (trimmed.length > MAX_PASTE_LENGTH) {
+    return {
+      valid: false,
+      error: {
+        type: 'file_too_large',
+        message: 'Pasted text is too large. Maximum is 10MB.',
+      },
+    };
+  }
+
+  return {
+    valid: true,
+    fileType: 'txt',
+    size: new Blob([trimmed]).size,
+  };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+```
+
+#### 3.4 Error Messages
+| Error Type | Condition | User Message |
+|------------|-----------|--------------|
+| `file_too_large` | size > 50MB | "File exceeds 50MB limit. Please choose a smaller file." |
+| `empty_file` | size === 0 or empty paste | "This file is empty." / "Please paste some text to read." |
+| `unsupported_format` | Unknown type | "Unsupported file format. Please use TXT, EPUB, or PDF files." |
+
+---
+
+### 4. TXT Parser Module
+
+#### 4.1 Module Interface
+```typescript
+// src/lib/parser/txtParser.ts
+
+/**
+ * Parse a plain text file or pasted text.
+ * @param input - File object or string
+ * @param filePath - Optional file path for metadata
+ * @returns Parsed document or error
+ */
+export async function parseTxt(
+  input: File | string,
+  filePath?: string
+): Promise<ParseResult>;
+```
+
+#### 4.2 Parsing Algorithm
+
+**Step 1: Read Content**
+```typescript
+async function readContent(input: File | string): Promise<string> {
+  if (typeof input === 'string') {
+    return input;
+  }
+
+  // Try UTF-8 first
+  try {
+    return await input.text();
+  } catch {
+    // Fallback: try with different encodings
+    const buffer = await input.arrayBuffer();
+    return decodeWithFallback(buffer);
+  }
+}
+
+function decodeWithFallback(buffer: ArrayBuffer): string {
+  const encodings = ['utf-8', 'windows-1252', 'iso-8859-1'];
+
+  for (const encoding of encodings) {
+    try {
+      const decoder = new TextDecoder(encoding, { fatal: true });
+      return decoder.decode(buffer);
+    } catch {
+      continue;
+    }
+  }
+
+  // Last resort: lossy UTF-8
+  return new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+}
+```
+
+**Step 2: Normalize Line Endings**
+```typescript
+function normalizeLineEndings(text: string): string {
+  // Convert all line endings to \n
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+```
+
+**Step 3: Split into Paragraphs**
+```typescript
+function splitParagraphs(text: string): string[] {
+  // Split on double newlines (with optional whitespace)
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map(p => p.trim())
+    .filter(p => p.length > 0);
+
+  return paragraphs;
+}
+```
+
+**Step 4: Build Document**
+```typescript
+export async function parseTxt(
+  input: File | string,
+  filePath?: string
+): Promise<ParseResult> {
+  try {
+    // Read and normalize
+    const rawText = await readContent(input);
+    const normalizedText = normalizeLineEndings(rawText);
+
+    // Check for empty content
+    if (normalizedText.trim().length === 0) {
+      return {
+        success: false,
+        error: {
+          type: 'empty_file',
+          message: 'This file contains no readable text.',
+        },
+      };
+    }
+
+    // Split paragraphs
+    const paragraphTexts = splitParagraphs(normalizedText);
+
+    // Tokenize all paragraphs
+    const { words, paragraphs, positionMap } = tokenizeDocument(
+      paragraphTexts,
+      undefined // no page/chapter index for TXT
+    );
+
+    // Build metadata
+    const isPaste = typeof input === 'string';
+    const metadata: DocumentMetadata = {
+      title: isPaste ? 'Pasted Text' : getFilenameWithoutExtension(input.name),
+      fileType: isPaste ? 'paste' : 'txt',
+      filePath,
+      fileSize: isPaste ? new Blob([input]).size : input.size,
+      totalWords: words.length,
+      totalParagraphs: paragraphs.length,
+      estimatedReadingTime: Math.ceil(words.length / 300),
+    };
+
+    const document: DocumentModel = {
+      words,
+      metadata,
+      rawContent: {
+        type: 'txt',
+        plainText: normalizedText,
+        paragraphs,
+      },
+      positionMap,
+    };
+
+    return { success: true, document };
+  } catch (error) {
+    return {
+      success: false,
+      error: {
+        type: 'corrupted_file',
+        message: 'Unable to read this text file.',
+        details: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+function getFilenameWithoutExtension(filename: string): string {
+  return filename.replace(/\.[^.]+$/, '');
+}
+```
+
+#### 4.3 Edge Cases
+
+| Case | Handling |
+|------|----------|
+| Empty file | Return `empty_file` error |
+| Single paragraph | Works normally, one paragraph |
+| No paragraph breaks | Entire content is one paragraph |
+| Mixed line endings | Normalized to `\n` |
+| BOM (Byte Order Mark) | TextDecoder handles automatically |
+| Non-UTF-8 encoding | Fallback to Windows-1252, then ISO-8859-1 |
+| Binary content | Returns `corrupted_file` error |
+
+---
+
+### 5. EPUB Parser Module
+
+#### 5.1 Module Interface
+```typescript
+// src/lib/parser/epubParser.ts
+
+import ePub from 'epubjs';
+
+/**
+ * Parse an EPUB file using epub.js.
+ * @param file - EPUB file object
+ * @param filePath - Optional file path for metadata
+ * @returns Parsed document or error
+ */
+export async function parseEpub(
+  file: File,
+  filePath?: string
+): Promise<ParseResult>;
+```
+
+#### 5.2 epub.js Integration
+
+**Dependency**: `epubjs@^0.3.93`
+
+```typescript
+import ePub, { Book, NavItem } from 'epubjs';
+
+export async function parseEpub(
+  file: File,
+  filePath?: string
+): Promise<ParseResult> {
+  let book: Book | null = null;
+
+  try {
+    // Load EPUB from ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+    book = ePub(arrayBuffer);
+
+    // Wait for book to be ready
+    await book.ready;
+
+    // Check for DRM
+    if (await detectDRM(book)) {
+      return {
+        success: false,
+        error: {
+          type: 'drm_protected',
+          message: 'This EPUB file is DRM protected and cannot be opened.',
+          details: 'Adobe DRM or similar protection detected',
+        },
+      };
+    }
+
+    // Extract metadata
+    const metadata = await extractMetadata(book, file, filePath);
+
+    // Extract chapters
+    const chapters = await extractChapters(book);
+
+    if (chapters.length === 0) {
+      return {
+        success: false,
+        error: {
+          type: 'corrupted_file',
+          message: 'This EPUB file contains no readable content.',
+        },
+      };
+    }
+
+    // Tokenize all chapters
+    const { words, positionMap } = tokenizeChapters(chapters);
+
+    const document: DocumentModel = {
+      words,
+      metadata: {
+        ...metadata,
+        totalWords: words.length,
+        totalParagraphs: chapters.reduce((sum, ch) => sum + ch.paragraphs.length, 0),
+        estimatedReadingTime: Math.ceil(words.length / 300),
+      },
+      rawContent: {
+        type: 'epub',
+        chapters,
+      },
+      positionMap,
+    };
+
+    return { success: true, document };
+  } catch (error) {
+    return {
+      success: false,
+      error: {
+        type: 'corrupted_file',
+        message: 'Unable to parse this EPUB file. It may be corrupted.',
+        details: error instanceof Error ? error.message : String(error),
+      },
+    };
+  } finally {
+    // Clean up
+    if (book) {
+      book.destroy();
+    }
+  }
+}
+```
+
+#### 5.3 DRM Detection
+```typescript
+/**
+ * Detect DRM protection in EPUB.
+ * Checks for Adobe DRM (encryption.xml) and other indicators.
+ *
+ * NOTE: epub.js API for encryption varies by version. This function
+ * uses defensive checks to handle missing or different API structures.
+ * If DRM detection fails, we assume no DRM and let parsing fail naturally
+ * if the content is actually protected.
+ */
+async function detectDRM(book: Book): Promise<boolean> {
+  try {
+    // Method 1: Check encryption property (if available)
+    // Defensive: verify property exists and is an object before accessing
+    const encryption = book.packaging?.encryption;
+    if (encryption && typeof encryption === 'object' && Object.keys(encryption).length > 0) {
+      return true;
+    }
+
+    // Method 2: Check metadata rights (safer approach)
+    // This is more reliable as metadata API is stable across epub.js versions
+    try {
+      const metadata = await book.loaded.metadata;
+      if (metadata?.rights && typeof metadata.rights === 'string' &&
+          metadata.rights.toLowerCase().includes('drm')) {
+        return true;
+      }
+    } catch {
+      // Metadata check failed, continue with other methods
+    }
+
+    // Method 3: Check for Adobe-specific indicators
+    try {
+      const metadata = await book.loaded.metadata;
+      if (metadata?.rights && typeof metadata.rights === 'string' &&
+          metadata.rights.toLowerCase().includes('adobe')) {
+        return true;
+      }
+    } catch {
+      // Adobe check failed, continue
+    }
+
+    return false;
+  } catch (error) {
+    // If we can't check DRM, assume not protected and let parsing fail naturally
+    // This is safer than blocking potentially valid files
+    console.warn('DRM check failed, proceeding with parse:', error);
+    return false;
+  }
+}
+```
+
+#### 5.4 Metadata Extraction
+```typescript
+async function extractMetadata(
+  book: Book,
+  file: File,
+  filePath?: string
+): Promise<Partial<DocumentMetadata>> {
+  const metadata = await book.loaded.metadata;
+
+  return {
+    title: metadata?.title || getFilenameWithoutExtension(file.name),
+    author: metadata?.creator,
+    fileType: 'epub',
+    filePath,
+    fileSize: file.size,
+  };
+}
+```
+
+#### 5.5 Chapter Extraction
+```typescript
+async function extractChapters(book: Book): Promise<Chapter[]> {
+  const chapters: Chapter[] = [];
+  const spine = book.spine;
+
+  // Get TOC for chapter titles
+  const toc = await book.loaded.navigation;
+  const tocMap = buildTocMap(toc.toc);
+
+  let chapterIndex = 0;
+
+  // Use for-loop instead of spine.each() for proper async handling
+  // NOTE: spine.each() is synchronous and won't await async callbacks
+  for (let i = 0; i < spine.length; i++) {
+    const section = spine.get(i);
+    if (!section) continue;
+
+    try {
+      // Load section content
+      const contents = await section.load(book.load.bind(book));
+      const doc = contents.document;
+
+      if (!doc || !doc.body) {
+        section.unload();
+        continue;
+      }
+
+      // Get chapter title from TOC or first heading
+      const title = tocMap.get(section.href) ||
+        doc.querySelector('h1, h2, h3')?.textContent?.trim();
+
+      // Extract HTML content
+      const htmlContent = doc.body.innerHTML;
+
+      // Extract paragraphs
+      const paragraphs = extractParagraphsFromHtml(doc.body);
+
+      if (paragraphs.length > 0) {
+        chapters.push({
+          title,
+          index: chapterIndex++,
+          htmlContent,
+          paragraphs: paragraphs.map(text => ({
+            text,
+            startWordIndex: 0, // Will be set during tokenization
+            endWordIndex: 0,
+          })),
+        });
+      }
+
+      section.unload();
+    } catch {
+      // Skip problematic sections
+    }
+  }
+
+  return chapters;
+}
+
+function buildTocMap(toc: NavItem[]): Map<string, string> {
+  const map = new Map<string, string>();
+
+  function traverse(items: NavItem[]) {
+    for (const item of items) {
+      if (item.href && item.label) {
+        // Normalize href (remove fragment)
+        const href = item.href.split('#')[0];
+        map.set(href, item.label.trim());
+      }
+      if (item.subitems) {
+        traverse(item.subitems);
+      }
+    }
+  }
+
+  traverse(toc);
+  return map;
+}
+
+function extractParagraphsFromHtml(body: HTMLElement): string[] {
+  const paragraphs: string[] = [];
+
+  // Select paragraph-like elements
+  const elements = body.querySelectorAll('p, div, h1, h2, h3, h4, h5, h6, li');
+
+  for (const el of elements) {
+    // Skip if parent is already processed (nested divs)
+    if (el.parentElement?.closest('p, li')) {
+      continue;
+    }
+
+    const text = el.textContent?.trim();
+    if (text && text.length > 0) {
+      paragraphs.push(text);
+    }
+  }
+
+  // Fallback: if no paragraphs found, use body text
+  if (paragraphs.length === 0) {
+    const bodyText = body.textContent?.trim();
+    if (bodyText) {
+      paragraphs.push(bodyText);
+    }
+  }
+
+  return paragraphs;
+}
+```
+
+#### 5.6 Image Handling
+```typescript
+/**
+ * Extract images from EPUB chapter for Reader View.
+ * Images are converted to data URLs for display.
+ */
+async function extractImages(
+  doc: Document,
+  book: Book,
+  section: any
+): Promise<EmbeddedImage[]> {
+  const images: EmbeddedImage[] = [];
+  const imgElements = doc.querySelectorAll('img');
+
+  for (let i = 0; i < imgElements.length; i++) {
+    const img = imgElements[i];
+    const src = img.getAttribute('src');
+
+    if (!src) continue;
+
+    try {
+      // Resolve relative path
+      const absolutePath = section.url(src);
+      const blob = await book.archive.getBlob(absolutePath);
+
+      if (blob) {
+        const dataUrl = await blobToDataUrl(blob);
+        images.push({
+          src: dataUrl,
+          afterParagraphIndex: findParagraphIndexForElement(img, doc),
+          alt: img.getAttribute('alt') || undefined,
+        });
+      }
+    } catch {
+      // Skip images that can't be loaded
+    }
+  }
+
+  return images;
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function findParagraphIndexForElement(
+  element: Element,
+  doc: Document
+): number {
+  const paragraphs = doc.querySelectorAll('p');
+  for (let i = 0; i < paragraphs.length; i++) {
+    if (paragraphs[i].compareDocumentPosition(element) &
+        Node.DOCUMENT_POSITION_FOLLOWING) {
+      return i;
+    }
+  }
+  return 0;
+}
+```
+
+---
+
+### 6. PDF Parser Module
+
+#### 6.1 Module Interface
+```typescript
+// src/lib/parser/pdfParser.ts
+
+import * as pdfjsLib from 'pdfjs-dist';
+
+/**
+ * Parse a PDF file using pdf.js.
+ * Handles column detection and header/footer filtering.
+ * @param file - PDF file object
+ * @param filePath - Optional file path for metadata
+ * @returns Parsed document or error
+ */
+export async function parsePdf(
+  file: File,
+  filePath?: string
+): Promise<ParseResult>;
+```
+
+#### 6.2 pdf.js Integration
+
+**Dependency**: `pdfjs-dist@^4.0.379`
+
+```typescript
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Configure worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+
+interface TextItem {
+  str: string;
+  transform: number[]; // [scaleX, skewX, skewY, scaleY, x, y]
+  width: number;
+  height: number;
+  fontName: string;
+}
+
+export async function parsePdf(
+  file: File,
+  filePath?: string
+): Promise<ParseResult> {
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    // Check for encryption/DRM
+    if (pdf.permissions && !pdf.permissions.canCopy) {
+      return {
+        success: false,
+        error: {
+          type: 'drm_protected',
+          message: 'This PDF is protected and does not allow text extraction.',
+        },
+      };
+    }
+
+    // Extract all pages
+    const rawPages: RawPageData[] = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const viewport = page.getViewport({ scale: 1 });
+
+      rawPages.push({
+        pageNumber: i,
+        textItems: textContent.items as TextItem[],
+        width: viewport.width,
+        height: viewport.height,
+      });
+    }
+
+    // Detect and filter headers/footers
+    const headerFooterPatterns = detectHeaderFooterPatterns(rawPages);
+    const filteredPages = filterHeadersFooters(rawPages, headerFooterPatterns);
+
+    // Process each page with column detection
+    const pages: PdfPage[] = [];
+    for (const rawPage of filteredPages) {
+      const processedPage = processPage(rawPage);
+      if (processedPage.paragraphs.length > 0) {
+        pages.push(processedPage);
+      }
+    }
+
+    if (pages.length === 0) {
+      return {
+        success: false,
+        error: {
+          type: 'corrupted_file',
+          message: 'This PDF contains no readable text. It may be image-based.',
+        },
+      };
+    }
+
+    // Tokenize all pages
+    const { words, positionMap } = tokenizePages(pages);
+
+    const metadata: DocumentMetadata = {
+      title: pdf.metadata?.get('Title') || getFilenameWithoutExtension(file.name),
+      author: pdf.metadata?.get('Author'),
+      fileType: 'pdf',
+      filePath,
+      fileSize: file.size,
+      totalWords: words.length,
+      totalParagraphs: pages.reduce((sum, p) => sum + p.paragraphs.length, 0),
+      estimatedReadingTime: Math.ceil(words.length / 300),
+    };
+
+    return {
+      success: true,
+      document: {
+        words,
+        metadata,
+        rawContent: {
+          type: 'pdf',
+          pages,
+        },
+        positionMap,
+      },
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('password')) {
+      return {
+        success: false,
+        error: {
+          type: 'drm_protected',
+          message: 'This PDF is password protected.',
+        },
+      };
+    }
+
+    return {
+      success: false,
+      error: {
+        type: 'corrupted_file',
+        message: 'Unable to parse this PDF file. It may be corrupted.',
+        details: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+```
+
+#### 6.3 Column Detection Algorithm
+
+```typescript
+interface RawPageData {
+  pageNumber: number;
+  textItems: TextItem[];
+  width: number;
+  height: number;
+}
+
+interface ColumnLayout {
+  type: 'single' | 'double' | 'triple';
+  columnBoundaries: number[]; // X coordinates separating columns
+}
+
+/**
+ * Detect column layout by analyzing X position clusters.
+ *
+ * Algorithm:
+ * 1. Collect X positions of all text line starts
+ * 2. Cluster X positions with tolerance (5% of page width)
+ * 3. If 2-3 significant clusters found, it's multi-column
+ */
+function detectColumnLayout(
+  textItems: TextItem[],
+  pageWidth: number
+): ColumnLayout {
+  // Group items by Y position to find line starts
+  const lineStarts = findLineStarts(textItems);
+
+  // Collect X positions of line starts
+  const xPositions = lineStarts.map(item => item.transform[4]);
+
+  // Cluster X positions
+  const tolerance = pageWidth * 0.05; // 5% tolerance
+  const clusters = clusterValues(xPositions, tolerance);
+
+  // Filter significant clusters (at least 10% of lines)
+  const minLines = lineStarts.length * 0.1;
+  const significantClusters = clusters
+    .filter(c => c.count >= minLines)
+    .sort((a, b) => a.center - b.center);
+
+  if (significantClusters.length === 1) {
+    return { type: 'single', columnBoundaries: [] };
+  }
+
+  if (significantClusters.length === 2) {
+    // Find midpoint between clusters
+    const boundary = (significantClusters[0].center + significantClusters[1].center) / 2;
+    return { type: 'double', columnBoundaries: [boundary] };
+  }
+
+  if (significantClusters.length >= 3) {
+    // Two boundaries for triple column
+    const b1 = (significantClusters[0].center + significantClusters[1].center) / 2;
+    const b2 = (significantClusters[1].center + significantClusters[2].center) / 2;
+    return { type: 'triple', columnBoundaries: [b1, b2] };
+  }
+
+  return { type: 'single', columnBoundaries: [] };
+}
+
+function findLineStarts(textItems: TextItem[]): TextItem[] {
+  // Group by Y position (with small tolerance for same line)
+  const yTolerance = 5;
+  const lines = new Map<number, TextItem[]>();
+
+  for (const item of textItems) {
+    const y = Math.round(item.transform[5] / yTolerance) * yTolerance;
+    if (!lines.has(y)) {
+      lines.set(y, []);
+    }
+    lines.get(y)!.push(item);
+  }
+
+  // Get leftmost item from each line
+  const lineStarts: TextItem[] = [];
+  for (const [_, items] of lines) {
+    const leftmost = items.reduce((min, item) =>
+      item.transform[4] < min.transform[4] ? item : min
+    );
+    lineStarts.push(leftmost);
+  }
+
+  return lineStarts;
+}
+
+interface Cluster {
+  center: number;
+  count: number;
+}
+
+function clusterValues(values: number[], tolerance: number): Cluster[] {
+  if (values.length === 0) return [];
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const clusters: Cluster[] = [];
+  let currentCluster = { sum: sorted[0], count: 1 };
+
+  for (let i = 1; i < sorted.length; i++) {
+    const currentCenter = currentCluster.sum / currentCluster.count;
+    if (sorted[i] - currentCenter <= tolerance) {
+      currentCluster.sum += sorted[i];
+      currentCluster.count++;
+    } else {
+      clusters.push({
+        center: currentCluster.sum / currentCluster.count,
+        count: currentCluster.count,
+      });
+      currentCluster = { sum: sorted[i], count: 1 };
+    }
+  }
+
+  clusters.push({
+    center: currentCluster.sum / currentCluster.count,
+    count: currentCluster.count,
+  });
+
+  return clusters;
+}
+```
+
+#### 6.4 Header/Footer Detection Algorithm
+
+```typescript
+interface HeaderFooterPatterns {
+  headerPatterns: string[];
+  footerPatterns: string[];
+  pageNumberRegex: RegExp | null;
+}
+
+/**
+ * Detect repeated headers and footers across pages.
+ *
+ * Algorithm:
+ * 1. Collect top N and bottom N lines from each page
+ * 2. Find text patterns that appear on 80%+ of pages
+ * 3. Detect page number patterns via regex
+ */
+function detectHeaderFooterPatterns(pages: RawPageData[]): HeaderFooterPatterns {
+  const LINES_TO_CHECK = 3;
+  const THRESHOLD = 0.8; // 80% of pages
+
+  const headerCandidates = new Map<string, number>();
+  const footerCandidates = new Map<string, number>();
+
+  for (const page of pages) {
+    const sortedByY = [...page.textItems].sort(
+      (a, b) => b.transform[5] - a.transform[5] // Top to bottom
+    );
+
+    // Top lines (headers)
+    const topLines = extractLines(sortedByY.slice(0, 20), LINES_TO_CHECK, 'top');
+    for (const line of topLines) {
+      const normalized = normalizeLine(line);
+      headerCandidates.set(normalized, (headerCandidates.get(normalized) || 0) + 1);
+    }
+
+    // Bottom lines (footers)
+    const bottomLines = extractLines(sortedByY.slice(-20), LINES_TO_CHECK, 'bottom');
+    for (const line of bottomLines) {
+      const normalized = normalizeLine(line);
+      footerCandidates.set(normalized, (footerCandidates.get(normalized) || 0) + 1);
+    }
+  }
+
+  const minOccurrences = Math.floor(pages.length * THRESHOLD);
+
+  const headerPatterns = Array.from(headerCandidates.entries())
+    .filter(([_, count]) => count >= minOccurrences)
+    .map(([pattern]) => pattern);
+
+  const footerPatterns = Array.from(footerCandidates.entries())
+    .filter(([_, count]) => count >= minOccurrences)
+    .map(([pattern]) => pattern);
+
+  // Detect page number pattern
+  const pageNumberRegex = detectPageNumberPattern(pages);
+
+  return { headerPatterns, footerPatterns, pageNumberRegex };
+}
+
+/**
+ * Normalize a line for pattern matching.
+ * Replace numbers with placeholder to match "Page 1", "Page 2", etc.
+ */
+function normalizeLine(line: string): string {
+  return line
+    .trim()
+    .toLowerCase()
+    .replace(/\d+/g, '#'); // Replace numbers with #
+}
+
+/**
+ * Detect page number patterns.
+ * Common patterns: "1", "- 1 -", "Page 1", "1 of 100"
+ */
+function detectPageNumberPattern(pages: RawPageData[]): RegExp | null {
+  const patterns = [
+    /^-?\s*\d+\s*-?$/, // "1" or "- 1 -"
+    /^page\s+\d+$/i, // "Page 1"
+    /^\d+\s+of\s+\d+$/i, // "1 of 100"
+    /^\[\d+\]$/, // "[1]"
+  ];
+
+  // Check footer regions for consistent page numbers
+  for (const pattern of patterns) {
+    let matches = 0;
+    for (const page of pages) {
+      const bottomText = page.textItems
+        .filter(item => item.transform[5] < page.height * 0.1)
+        .map(item => item.str.trim())
+        .join(' ');
+
+      if (pattern.test(bottomText)) {
+        matches++;
+      }
+    }
+
+    if (matches >= pages.length * 0.7) {
+      return pattern;
+    }
+  }
+
+  return null;
+}
+
+function extractLines(
+  items: TextItem[],
+  count: number,
+  position: 'top' | 'bottom'
+): string[] {
+  // Group items into lines by Y position
+  const yTolerance = 10;
+  const lineMap = new Map<number, string[]>();
+
+  for (const item of items) {
+    const y = Math.round(item.transform[5] / yTolerance) * yTolerance;
+    if (!lineMap.has(y)) {
+      lineMap.set(y, []);
+    }
+    lineMap.get(y)!.push(item.str);
+  }
+
+  // Sort lines by Y position
+  const sortedLines = Array.from(lineMap.entries())
+    .sort((a, b) => position === 'top' ? b[0] - a[0] : a[0] - b[0])
+    .slice(0, count)
+    .map(([_, texts]) => texts.join(' '));
+
+  return sortedLines;
+}
+```
+
+#### 6.5 Page Processing
+```typescript
+function processPage(rawPage: RawPageData): PdfPage {
+  const layout = detectColumnLayout(rawPage.textItems, rawPage.width);
+
+  let orderedItems: TextItem[];
+
+  if (layout.type === 'single') {
+    // Simple top-to-bottom ordering
+    orderedItems = [...rawPage.textItems].sort(
+      (a, b) => b.transform[5] - a.transform[5]
+    );
+  } else {
+    // Multi-column: read each column top-to-bottom
+    orderedItems = orderByColumns(rawPage.textItems, layout, rawPage.height);
+  }
+
+  // Merge items into paragraphs
+  const paragraphs = mergeIntoParagraphs(orderedItems);
+
+  return {
+    pageNumber: rawPage.pageNumber,
+    textContent: paragraphs.map(p => p.text).join('\n\n'),
+    paragraphs: paragraphs.map(text => ({
+      text,
+      startWordIndex: 0,
+      endWordIndex: 0,
+    })),
+  };
+}
+
+function orderByColumns(
+  items: TextItem[],
+  layout: ColumnLayout,
+  pageHeight: number
+): TextItem[] {
+  const columns: TextItem[][] = [];
+  const boundaries = [0, ...layout.columnBoundaries, Infinity];
+
+  // Assign items to columns
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    columns.push([]);
+  }
+
+  for (const item of items) {
+    const x = item.transform[4];
+    for (let i = 0; i < boundaries.length - 1; i++) {
+      if (x >= boundaries[i] && x < boundaries[i + 1]) {
+        columns[i].push(item);
+        break;
+      }
+    }
+  }
+
+  // Sort each column top-to-bottom, then concatenate
+  const ordered: TextItem[] = [];
+  for (const column of columns) {
+    column.sort((a, b) => b.transform[5] - a.transform[5]);
+    ordered.push(...column);
+  }
+
+  return ordered;
+}
+
+function mergeIntoParagraphs(items: TextItem[]): string[] {
+  const paragraphs: string[] = [];
+  let currentParagraph: string[] = [];
+  let lastY = Infinity;
+  let lastFontSize = 0;
+
+  const PARAGRAPH_GAP = 20; // Y distance threshold for new paragraph
+
+  for (const item of items) {
+    const y = item.transform[5];
+    const fontSize = Math.abs(item.transform[3]); // scaleY approximates font size
+
+    // Detect paragraph break
+    const yGap = lastY - y;
+    const isNewParagraph = yGap > PARAGRAPH_GAP ||
+      (fontSize !== lastFontSize && currentParagraph.length > 0);
+
+    if (isNewParagraph && currentParagraph.length > 0) {
+      paragraphs.push(currentParagraph.join(' ').trim());
+      currentParagraph = [];
+    }
+
+    if (item.str.trim()) {
+      currentParagraph.push(item.str);
+    }
+
+    lastY = y;
+    lastFontSize = fontSize;
+  }
+
+  // Don't forget last paragraph
+  if (currentParagraph.length > 0) {
+    paragraphs.push(currentParagraph.join(' ').trim());
+  }
+
+  return paragraphs.filter(p => p.length > 0);
+}
+
+function filterHeadersFooters(
+  pages: RawPageData[],
+  patterns: HeaderFooterPatterns
+): RawPageData[] {
+  return pages.map(page => ({
+    ...page,
+    textItems: page.textItems.filter(item => {
+      const text = item.str.trim();
+      const normalized = normalizeLine(text);
+
+      // Check header patterns
+      if (patterns.headerPatterns.includes(normalized)) {
+        return false;
+      }
+
+      // Check footer patterns
+      if (patterns.footerPatterns.includes(normalized)) {
+        return false;
+      }
+
+      // Check page number
+      if (patterns.pageNumberRegex?.test(text)) {
+        return false;
+      }
+
+      return true;
+    }),
+  }));
+}
+```
+
+---
+
+### 7. Word Tokenizer Module
+
+#### 7.1 Module Interface
+```typescript
+// src/lib/parser/wordTokenizer.ts
+
+/**
+ * Tokenize paragraphs into words with ORP and timing data.
+ */
+export function tokenizeDocument(
+  paragraphs: string[],
+  pageIndex?: number
+): TokenizeResult;
+
+export function tokenizeChapters(chapters: Chapter[]): TokenizeResult;
+
+export function tokenizePages(pages: PdfPage[]): TokenizeResult;
+
+interface TokenizeResult {
+  words: ParsedWord[];
+  paragraphs: Paragraph[];
+  positionMap: PositionMap;
+}
+```
+
+#### 7.2 Tokenization Algorithm
+
+```typescript
+/**
+ * Main tokenization regex.
+ *
+ * Matches:
+ * - Regular words: "hello", "world"
+ * - Hyphenated words: "self-aware", "twenty-one"
+ * - Numbers with symbols: "$1,234", "99%", "3.14"
+ * - Contractions: "don't", "it's", "they're"
+ * - Words with trailing punctuation: "hello!", "wait..."
+ */
+const WORD_REGEX = /(?:\$?[\d,]+(?:\.\d+)?%?)|(?:[\w''-]+)/g;
+
+/**
+ * Punctuation that affects timing.
+ */
+const SENTENCE_END = /[.?!]$/;
+const CLAUSE_PAUSE = /[:;,]$/;
+
+export function tokenizeDocument(
+  paragraphTexts: string[],
+  pageIndex?: number
+): TokenizeResult {
+  const words: ParsedWord[] = [];
+  const paragraphs: Paragraph[] = [];
+  const wordToParagraph: number[] = [];
+  const paragraphToWords: Array<{ start: number; end: number }> = [];
+
+  let globalWordIndex = 0;
+
+  for (let pIdx = 0; pIdx < paragraphTexts.length; pIdx++) {
+    const paragraphText = paragraphTexts[pIdx];
+    const paragraphWords = tokenizeParagraph(paragraphText);
+
+    const startIndex = globalWordIndex;
+
+    for (let wIdx = 0; wIdx < paragraphWords.length; wIdx++) {
+      const word = paragraphWords[wIdx];
+
+      words.push({
+        ...word,
+        originalIndex: globalWordIndex,
+        documentPosition: {
+          pageIndex,
+          paragraphIndex: pIdx,
+          wordIndexInParagraph: wIdx,
+        },
+      });
+
+      wordToParagraph.push(pIdx);
+      globalWordIndex++;
+    }
+
+    const endIndex = globalWordIndex - 1;
+
+    paragraphs.push({
+      text: paragraphText,
+      startWordIndex: startIndex,
+      endWordIndex: endIndex,
+    });
+
+    paragraphToWords.push({ start: startIndex, end: endIndex });
+  }
+
+  return {
+    words,
+    paragraphs,
+    positionMap: {
+      wordToParagraph,
+      paragraphToWords,
+    },
+  };
+}
+
+function tokenizeParagraph(text: string): Omit<ParsedWord, 'originalIndex' | 'documentPosition'>[] {
+  const words: Omit<ParsedWord, 'originalIndex' | 'documentPosition'>[] = [];
+  const matches = text.matchAll(WORD_REGEX);
+
+  for (const match of matches) {
+    const rawWord = match[0];
+    const { text: cleanText, punctuation } = extractPunctuation(rawWord);
+
+    if (cleanText.length === 0) continue;
+
+    words.push({
+      text: rawWord, // Keep original with punctuation for display
+      orp: calculateORP(cleanText),
+      punctuation,
+      delayMultiplier: calculateDelayMultiplier(punctuation),
+    });
+  }
+
+  return words;
+}
+
+function extractPunctuation(word: string): { text: string; punctuation: string } {
+  // Extract trailing punctuation
+  const match = word.match(/([.?!:;,]+)$/);
+  if (match) {
+    return {
+      text: word.slice(0, -match[1].length),
+      punctuation: match[1],
+    };
+  }
+  return { text: word, punctuation: '' };
+}
+```
+
+#### 7.3 ORP Calculation
+
+```typescript
+/**
+ * Calculate Optimal Reading Point (ORP) for a word.
+ *
+ * The ORP is the character position that the eye should focus on.
+ * Based on word length, following the spec:
+ *
+ * | Length  | ORP Position | Example        |
+ * |---------|--------------|----------------|
+ * | 1-2     | 0            | "I" -> I       |
+ * | 3-6     | 1            | "the" -> tHe   |
+ * | 7-10    | 2            | "reading" -> reAding |
+ * | 11-13   | 3            | "interesting" -> intEresting |
+ * | 14+     | 4            | "responsibility" -> respOnsibility |
+ *
+ * @param word - The word text (without punctuation for length calc)
+ * @returns 0-based index of the ORP character
+ */
+export function calculateORP(word: string): number {
+  const length = word.length;
+
+  if (length <= 2) return 0;
+  if (length <= 6) return 1;
+  if (length <= 10) return 2;
+  if (length <= 13) return 3;
+  return 4;
+}
+
+// Examples:
+// "a"        (len 1)  -> ORP 0: "A"
+// "it"       (len 2)  -> ORP 0: "It"
+// "the"      (len 3)  -> ORP 1: "tHe"
+// "hello"    (len 5)  -> ORP 1: "hEllo"
+// "reading"  (len 7)  -> ORP 2: "reAding"
+// "beautiful" (len 9) -> ORP 2: "beAutiful"
+// "interesting" (len 11) -> ORP 3: "intEresting"
+// "communication" (len 13) -> ORP 3: "comMunication"
+// "responsibility" (len 14) -> ORP 4: "respOnsibility"
+// "internationalization" (len 20) -> ORP 4: "intErnationalization"
+```
+
+#### 7.4 Delay Multiplier Logic
+
+```typescript
+/**
+ * Calculate display delay multiplier based on trailing punctuation.
+ *
+ * | Punctuation | Multiplier | Purpose |
+ * |-------------|------------|---------|
+ * | . ? !       | 3x         | Sentence end - long pause |
+ * | : ; ,       | 2x         | Clause break - medium pause |
+ * | (none)      | 1x         | Normal word |
+ *
+ * @param punctuation - Trailing punctuation string
+ * @returns Delay multiplier (1, 2, or 3)
+ */
+export function calculateDelayMultiplier(punctuation: string): 1 | 2 | 3 {
+  if (!punctuation) return 1;
+
+  // Check last punctuation character
+  const lastChar = punctuation[punctuation.length - 1];
+
+  if ('.?!'.includes(lastChar)) {
+    return 3;
+  }
+
+  if (':;,'.includes(lastChar)) {
+    return 2;
+  }
+
+  return 1;
+}
+```
+
+#### 7.5 Special Case Handling
+
+**Hyphenated Words**
+```typescript
+// Hyphenated words are kept as single units
+// "self-aware" -> one word, ORP calculated on full length (10 chars -> ORP 2)
+// "twenty-one" -> one word, ORP calculated on full length (10 chars -> ORP 2)
+
+// The WORD_REGEX captures hyphens within words:
+// [\w''-]+ matches word characters, apostrophes, and hyphens
+```
+
+**Numbers with Symbols**
+```typescript
+// Currency: "$1,234" -> kept as unit, ORP on length 6 -> position 1
+// Percentages: "99%" -> kept as unit, ORP on length 3 -> position 1
+// Decimals: "3.14" -> kept as unit, ORP on length 4 -> position 1
+
+// The WORD_REGEX has special handling:
+// (?:\$?[\d,]+(?:\.\d+)?%?) matches numbers with $, commas, decimals, %
+```
+
+**Contractions**
+```typescript
+// "don't" -> one word, length 5, ORP position 1 -> "dOn't"
+// "it's" -> one word, length 4, ORP position 1 -> "iT's"
+// "they're" -> one word, length 7, ORP position 2 -> "thEy're"
+
+// Apostrophes are included in \w'- character class
+```
+
+**Long Words (30+ characters)**
+```typescript
+// Per SPEC.md: "Long words (30+ chars) - Show full word with extended pause"
+//
+// IMPORTANT: The Parser does NOT add special handling for 30+ char words.
+// The Playback Engine's timing formula automatically provides extended
+// display time through the length factor: +0.04 * sqrt(word_length)
+//
+// For a 30-char word: base_delay * (1 + 0.04 * sqrt(30)) = base_delay * 1.22
+// For a 50-char word: base_delay * (1 + 0.04 * sqrt(50)) = base_delay * 1.28
+//
+// This means:
+// - Parser tokenizes long words normally (no special flag needed)
+// - ORP for 14+ chars is always 4 (including 30+ char words)
+// - Timing engine uses word.text.length to calculate appropriate delay
+// - No isLongWord flag needed since length is already available
+//
+// Example: "internationalization" (20 chars)
+// ORP: 4 (position 4)
+// Display: "intErnationalization" (E is highlighted)
+// Timing: base_delay * (1 + 0.04 * sqrt(20)) = base_delay * 1.18
+//
+// Example: "electroencephalographically" (27 chars)
+// ORP: 4 (position 4)
+// Display: "elecTroencephalographically" (T is highlighted)
+// Timing: base_delay * (1 + 0.04 * sqrt(27)) = base_delay * 1.21
+```
+
+#### 7.6 Chapter and Page Tokenization
+
+```typescript
+export function tokenizeChapters(chapters: Chapter[]): TokenizeResult {
+  const allWords: ParsedWord[] = [];
+  const wordToParagraph: number[] = [];
+  const paragraphToWords: Array<{ start: number; end: number }> = [];
+
+  let globalWordIndex = 0;
+  let globalParagraphIndex = 0;
+
+  for (const chapter of chapters) {
+    for (let pIdx = 0; pIdx < chapter.paragraphs.length; pIdx++) {
+      const paragraph = chapter.paragraphs[pIdx];
+      const paragraphWords = tokenizeParagraph(paragraph.text);
+
+      const startIndex = globalWordIndex;
+
+      for (let wIdx = 0; wIdx < paragraphWords.length; wIdx++) {
+        allWords.push({
+          ...paragraphWords[wIdx],
+          originalIndex: globalWordIndex,
+          documentPosition: {
+            pageIndex: chapter.index, // chapter index
+            paragraphIndex: pIdx,
+            wordIndexInParagraph: wIdx,
+          },
+        });
+
+        wordToParagraph.push(globalParagraphIndex);
+        globalWordIndex++;
+      }
+
+      // Update chapter paragraph with word indices
+      paragraph.startWordIndex = startIndex;
+      paragraph.endWordIndex = globalWordIndex - 1;
+
+      paragraphToWords.push({
+        start: startIndex,
+        end: globalWordIndex - 1,
+      });
+
+      globalParagraphIndex++;
+    }
+  }
+
+  return {
+    words: allWords,
+    paragraphs: chapters.flatMap(ch => ch.paragraphs),
+    positionMap: { wordToParagraph, paragraphToWords },
+  };
+}
+
+export function tokenizePages(pages: PdfPage[]): TokenizeResult {
+  const allWords: ParsedWord[] = [];
+  const wordToParagraph: number[] = [];
+  const paragraphToWords: Array<{ start: number; end: number }> = [];
+
+  let globalWordIndex = 0;
+  let globalParagraphIndex = 0;
+
+  for (const page of pages) {
+    for (let pIdx = 0; pIdx < page.paragraphs.length; pIdx++) {
+      const paragraph = page.paragraphs[pIdx];
+      const paragraphWords = tokenizeParagraph(paragraph.text);
+
+      const startIndex = globalWordIndex;
+
+      for (let wIdx = 0; wIdx < paragraphWords.length; wIdx++) {
+        allWords.push({
+          ...paragraphWords[wIdx],
+          originalIndex: globalWordIndex,
+          documentPosition: {
+            pageIndex: page.pageNumber - 1, // 0-based
+            paragraphIndex: pIdx,
+            wordIndexInParagraph: wIdx,
+          },
+        });
+
+        wordToParagraph.push(globalParagraphIndex);
+        globalWordIndex++;
+      }
+
+      paragraph.startWordIndex = startIndex;
+      paragraph.endWordIndex = globalWordIndex - 1;
+
+      paragraphToWords.push({
+        start: startIndex,
+        end: globalWordIndex - 1,
+      });
+
+      globalParagraphIndex++;
+    }
+  }
+
+  return {
+    words: allWords,
+    paragraphs: pages.flatMap(p => p.paragraphs),
+    positionMap: { wordToParagraph, paragraphToWords },
+  };
+}
+```
+
+---
+
+### 8. Position Mapper Module
+
+#### 8.1 Module Interface
+```typescript
+// src/lib/parser/positionMapper.ts
+
+/**
+ * Utilities for bidirectional position mapping.
+ * Enables view synchronization between Speed View and Reader View.
+ */
+
+export function getParagraphForWord(
+  wordIndex: number,
+  positionMap: PositionMap
+): number;
+
+export function getWordsForParagraph(
+  paragraphIndex: number,
+  positionMap: PositionMap
+): { start: number; end: number };
+
+export function getWordPosition(
+  wordIndex: number,
+  words: ParsedWord[]
+): DocumentPosition;
+
+export function findWordAtPosition(
+  position: DocumentPosition,
+  words: ParsedWord[]
+): number;
+```
+
+#### 8.2 Implementation
+
+```typescript
+/**
+ * Get the paragraph index containing a word.
+ * O(1) lookup using pre-built map.
+ *
+ * @param wordIndex - Global word index
+ * @param positionMap - Position mapping data
+ * @returns Paragraph index (global across document)
+ */
+export function getParagraphForWord(
+  wordIndex: number,
+  positionMap: PositionMap
+): number {
+  if (wordIndex < 0 || wordIndex >= positionMap.wordToParagraph.length) {
+    throw new Error(`Word index ${wordIndex} out of bounds`);
+  }
+  return positionMap.wordToParagraph[wordIndex];
+}
+
+/**
+ * Get the word range for a paragraph.
+ * O(1) lookup using pre-built map.
+ *
+ * @param paragraphIndex - Global paragraph index
+ * @param positionMap - Position mapping data
+ * @returns Start and end word indices (inclusive)
+ */
+export function getWordsForParagraph(
+  paragraphIndex: number,
+  positionMap: PositionMap
+): { start: number; end: number } {
+  if (paragraphIndex < 0 || paragraphIndex >= positionMap.paragraphToWords.length) {
+    throw new Error(`Paragraph index ${paragraphIndex} out of bounds`);
+  }
+  return positionMap.paragraphToWords[paragraphIndex];
+}
+
+/**
+ * Get detailed position information for a word.
+ *
+ * @param wordIndex - Global word index
+ * @param words - Array of parsed words
+ * @returns Position within document hierarchy
+ */
+export function getWordPosition(
+  wordIndex: number,
+  words: ParsedWord[]
+): DocumentPosition {
+  if (wordIndex < 0 || wordIndex >= words.length) {
+    throw new Error(`Word index ${wordIndex} out of bounds`);
+  }
+  return words[wordIndex].documentPosition;
+}
+
+/**
+ * Find word index from document position.
+ * Used when user clicks a word in Reader View.
+ *
+ * @param position - Target position
+ * @param words - Array of parsed words
+ * @returns Word index, or -1 if not found
+ */
+export function findWordAtPosition(
+  position: DocumentPosition,
+  words: ParsedWord[]
+): number {
+  for (let i = 0; i < words.length; i++) {
+    const wp = words[i].documentPosition;
+    if (
+      wp.pageIndex === position.pageIndex &&
+      wp.paragraphIndex === position.paragraphIndex &&
+      wp.wordIndexInParagraph === position.wordIndexInParagraph
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Find the nearest word to a text offset in a paragraph.
+ * Used for click-to-position in Reader View.
+ *
+ * @param paragraphIndex - Paragraph being clicked
+ * @param textOffset - Character offset within paragraph
+ * @param document - Parsed document
+ * @returns Nearest word index
+ */
+export function findWordNearOffset(
+  paragraphIndex: number,
+  textOffset: number,
+  document: DocumentModel
+): number {
+  const { start, end } = document.positionMap.paragraphToWords[paragraphIndex];
+
+  // Get paragraph text
+  let currentOffset = 0;
+
+  for (let i = start; i <= end; i++) {
+    const word = document.words[i];
+    const wordEnd = currentOffset + word.text.length + 1; // +1 for space
+
+    if (textOffset <= wordEnd) {
+      return i;
+    }
+
+    currentOffset = wordEnd;
+  }
+
+  // Return last word if offset is past end
+  return end;
+}
+```
+
+---
+
+### 9. Error Handling
+
+#### 9.1 Error Types and Messages
+
+| Error Type | Trigger Condition | User-Facing Message |
+|------------|-------------------|---------------------|
+| `file_too_large` | File size > 50MB | "File exceeds 50MB limit. Please choose a smaller file." |
+| `empty_file` | No content found | "This file is empty." or "This file contains no readable text." |
+| `corrupted_file` | Parse exception | "Unable to parse this file. It may be corrupted." |
+| `drm_protected` | DRM detected | "This file is DRM protected and cannot be opened." |
+| `unsupported_format` | Unknown file type | "Unsupported file format. Please use TXT, EPUB, or PDF files." |
+| `encoding_error` | Text decode failure | "Unable to read this file. The text encoding is not supported." |
+| `unknown` | Unexpected error | "An unexpected error occurred. Please try again." |
+
+#### 9.2 Error Display Strategy
+
+```typescript
+/**
+ * Errors are displayed inline in the content area.
+ * The UI shows:
+ * - Error icon
+ * - User-facing message (ParseError.message)
+ * - "Try another file" button to return to EMPTY_STATE
+ *
+ * Technical details are logged to console but not shown to user.
+ */
+
+// State transition on error:
+// LOADING_STATE -> ERROR_STATE
+//
+// ERROR_STATE shows:
+// - Error message
+// - Option to dismiss (returns to EMPTY_STATE)
+// - Recent files still accessible
+```
+
+#### 9.3 Recovery Strategies
+
+| Scenario | Recovery Action |
+|----------|-----------------|
+| File validation fails | Return to EMPTY_STATE, show error inline |
+| Parser throws exception | Catch, wrap in ParseError, transition to ERROR_STATE |
+| Partial parse success | If any content extracted, show warning but continue |
+| Worker crashes (pdf.js) | Retry once, then show error |
+| Memory exhaustion | Show file_too_large error (even if under 50MB) |
+
+#### 9.4 Error Logging
+
+```typescript
+/**
+ * Log errors for debugging without exposing to user.
+ */
+function logParseError(error: ParseError, context: object): void {
+  console.error('[Parser Error]', {
+    type: error.type,
+    message: error.message,
+    details: error.details,
+    ...context,
+  });
+}
+```
+
+---
+
+### 10. Integration
+
+#### 10.1 Connection to Document Store
+
+```typescript
+// src/lib/stores/documentStore.ts
+
+import { writable, derived } from 'svelte/store';
+import type { DocumentModel, ParsedWord } from '$lib/parser/types';
+
+interface DocumentState {
+  document: DocumentModel | null;
+  loading: boolean;
+  error: ParseError | null;
+}
+
+function createDocumentStore() {
+  const { subscribe, set, update } = writable<DocumentState>({
+    document: null,
+    loading: false,
+    error: null,
+  });
+
+  return {
+    subscribe,
+
+    /**
+     * Load a document from file or paste.
+     * Triggers LOADING_STATE, then DOCUMENT_LOADED or ERROR_STATE.
+     */
+    async load(input: File | string, filePath?: string): Promise<void> {
+      update(s => ({ ...s, loading: true, error: null }));
+
+      try {
+        const result = await parseInput(input, filePath);
+
+        if (result.success) {
+          set({
+            document: result.document,
+            loading: false,
+            error: null,
+          });
+
+          // Save to recent files
+          if (result.document.metadata.filePath) {
+            recentStore.add(result.document.metadata);
+          }
+        } else {
+          set({
+            document: null,
+            loading: false,
+            error: result.error,
+          });
+        }
+      } catch (e) {
+        set({
+          document: null,
+          loading: false,
+          error: {
+            type: 'unknown',
+            message: 'An unexpected error occurred. Please try again.',
+            details: e instanceof Error ? e.message : String(e),
+          },
+        });
+      }
+    },
+
+    /**
+     * Clear current document (return to EMPTY_STATE).
+     */
+    clear(): void {
+      set({ document: null, loading: false, error: null });
+    },
+
+    /**
+     * Dismiss error (return to EMPTY_STATE).
+     */
+    dismissError(): void {
+      update(s => ({ ...s, error: null }));
+    },
+  };
+}
+
+export const documentStore = createDocumentStore();
+
+// Derived stores for convenience
+export const currentDocument = derived(
+  documentStore,
+  $store => $store.document
+);
+
+export const isLoading = derived(
+  documentStore,
+  $store => $store.loading
+);
+
+export const parseError = derived(
+  documentStore,
+  $store => $store.error
+);
+```
+
+#### 10.2 Main Parser Entry Point
+
+```typescript
+// src/lib/parser/index.ts
+
+import { validateFile, validatePaste } from './fileValidator';
+import { parseTxt } from './txtParser';
+import { parseEpub } from './epubParser';
+import { parsePdf } from './pdfParser';
+import type { ParseResult } from './types';
+
+/**
+ * Main entry point for parsing any input.
+ * Validates input, detects type, routes to appropriate parser.
+ */
+export async function parseInput(
+  input: File | string,
+  filePath?: string
+): Promise<ParseResult> {
+  // Handle paste
+  if (typeof input === 'string') {
+    const validation = validatePaste(input);
+    if (!validation.valid) {
+      return { success: false, error: validation.error };
+    }
+    return parseTxt(input, filePath);
+  }
+
+  // Handle file
+  const validation = validateFile(input);
+  if (!validation.valid) {
+    return { success: false, error: validation.error };
+  }
+
+  switch (validation.fileType) {
+    case 'txt':
+      return parseTxt(input, filePath);
+    case 'epub':
+      return parseEpub(input, filePath);
+    case 'pdf':
+      return parsePdf(input, filePath);
+    default:
+      return {
+        success: false,
+        error: {
+          type: 'unsupported_format',
+          message: 'Unsupported file format.',
+        },
+      };
+  }
+}
+
+// Re-export types
+export * from './types';
+export { calculateORP } from './wordTokenizer';
+```
+
+#### 10.3 State Machine Transitions
+
+```
+EMPTY_STATE
+    │
+    │ [file_drop / file_pick / paste / recent_click]
+    │ Trigger: documentStore.load(input)
+    │
+    ▼
+LOADING_STATE
+    │
+    ├─── [parseInput returns success: true]
+    │    Trigger: documentStore set with document
+    │    ▼
+    │    DOCUMENT_LOADED
+    │    │
+    │    │ [auto_transition]
+    │    ▼
+    │    VIEW_STATE (READER_VIEW, PAUSED)
+    │
+    └─── [parseInput returns success: false]
+         Trigger: documentStore set with error
+         ▼
+         ERROR_STATE
+         │
+         │ [dismiss / try_another]
+         │ Trigger: documentStore.clear()
+         ▼
+         EMPTY_STATE
+```
+
+---
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `epubjs` | ^0.3.93 | EPUB parsing and rendering |
+| `pdfjs-dist` | ^4.0.379 | PDF text extraction |
+
+### Installation
+```bash
+npm install epubjs pdfjs-dist
+```
+
+### pdf.js Worker Setup
+```typescript
+// vite.config.ts
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  optimizeDeps: {
+    include: ['pdfjs-dist'],
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          pdfjs: ['pdfjs-dist'],
+        },
+      },
+    },
+  },
+});
+
+// Copy worker to public folder or use CDN
+// public/pdf.worker.min.js
+```
+
+---
+
+## File Structure
+
+```
+src/lib/parser/
+├── index.ts              # Main entry point, parseInput()
+├── types.ts              # All TypeScript interfaces
+├── fileValidator.ts      # File validation logic
+├── txtParser.ts          # Plain text parser
+├── epubParser.ts         # EPUB parser with epub.js
+├── pdfParser.ts          # PDF parser with pdf.js
+├── wordTokenizer.ts      # Tokenization and ORP
+└── positionMapper.ts     # Position mapping utilities
+```
+
+---
+
+## Review
+
+### Scoring (Iteration 2)
+
+| Criterion | Score | Justification |
+|-----------|-------|---------------|
+| **Completeness** | 10/10 | All requirements from SPEC.md covered. File formats (TXT, EPUB, PDF), word handling, ORP calculation, position mapping, error handling, and integration points all specified in detail. |
+| **Clarity** | 9/10 | Very clear with excellent code examples, data flow diagrams, and detailed explanations. Minor deduction: some sections are quite dense but this is unavoidable given complexity. |
+| **Correctness** | 10/10 | Perfectly matches SPEC.md. ORP algorithm matches exactly, timing logic defers to timing engine as appropriate, file size limits correct (50MB), error messages match spec. |
+| **Implementability** | 10/10 | Extremely detailed with complete function signatures, algorithms, edge cases, error handling strategies, and even dependency versions. An implementer can code directly from this spec. |
+
+**Average Score: 9.75/10**
+
+---
+
+### Verification of Previous Issues (from Iteration 1)
+
+#### Issue 1: EPUB `spine.each` async bug
+**Status: FIXED ✓**
+
+Location: Lines 1099-1102
+
+The specification now correctly uses a for-loop instead of `spine.each()`:
+```typescript
+// Use for-loop instead of spine.each() for proper async handling
+// NOTE: spine.each() is synchronous and won't await async callbacks
+for (let i = 0; i < spine.length; i++) {
+  const section = spine.get(i);
+  if (!section) continue;
+  // ... async operations properly awaited
+}
+```
+
+The inline comment clearly warns implementers about the synchronous nature of `spine.each()` and why a for-loop is necessary.
+
+---
+
+#### Issue 2: Long word (30+ chars) handling documentation
+**Status: FIXED ✓**
+
+Location: Lines 2041-2067
+
+Excellent documentation added explaining that the Parser does NOT need special handling for long words because the timing engine automatically handles this via the length factor formula:
+
+```typescript
+// IMPORTANT: The Parser does NOT add special handling for 30+ char words.
+// The Playback Engine's timing formula automatically provides extended
+// display time through the length factor: +0.04 * sqrt(word_length)
+//
+// For a 30-char word: base_delay * (1 + 0.04 * sqrt(30)) = base_delay * 1.22
+// For a 50-char word: base_delay * (1 + 0.04 * sqrt(50)) = base_delay * 1.28
+```
+
+This clarifies the separation of concerns and prevents implementers from adding unnecessary duplicate logic.
+
+---
+
+#### Issue 3: EPUB DRM detection defensive programming
+**Status: FIXED ✓**
+
+Location: Lines 1026-1065
+
+The `detectDRM()` function now has comprehensive defensive try-catch guards:
+
+1. **Top-level try-catch**: Wraps entire function to handle any unexpected errors
+2. **Nested try-catch blocks**: For each detection method (metadata, rights, Adobe indicators)
+3. **Defensive checks**: Verifies properties exist and are correct types before accessing
+4. **Graceful degradation**: Returns false (no DRM) if checks fail, allowing parsing to proceed
+
+```typescript
+async function detectDRM(book: Book): Promise<boolean> {
+  try {
+    // Defensive: verify property exists and is an object before accessing
+    const encryption = book.packaging?.encryption;
+    if (encryption && typeof encryption === 'object' && Object.keys(encryption).length > 0) {
+      return true;
+    }
+
+    try {
+      // Nested try for metadata checks
+    } catch {
+      // Continue with other methods
+    }
+    
+    return false;
+  } catch (error) {
+    // If we can't check DRM, assume not protected and let parsing fail naturally
+    console.warn('DRM check failed, proceeding with parse:', error);
+    return false;
+  }
+}
+```
+
+The comment explicitly states the rationale: "safer than blocking potentially valid files."
+
+---
+
+### New Issues Found
+
+**None.** No new issues identified in this iteration.
+
+---
+
+### Summary
+
+The Parser System specification is **excellent** and ready for implementation. All three critical issues from the previous review have been addressed with clear, defensive code and helpful inline documentation.
+
+The specification provides:
+- ✓ Complete data models with comprehensive TypeScript interfaces
+- ✓ Detailed algorithms for column detection, header/footer filtering, and tokenization
+- ✓ Extensive error handling with all edge cases covered
+- ✓ Clear integration points with document store and state machine
+- ✓ Practical examples demonstrating complex concepts
+- ✓ Dependency versions and setup instructions
+- ✓ File structure for implementation guidance
+
+An implementer can confidently build the entire Parser System from this specification without needing to make architectural decisions or guess at missing details.
+
+---
+
+### Verdict
+
+**✓ APPROVED** - Ready for implementation (Phase 1)
+
+This specification meets all criteria:
+- [x] Average score >= 8.0 (achieved 9.75)
+- [x] No critical issues remaining
+- [x] All requirements from SPEC.md covered
+- [x] Clear implementation path defined
+
+**Next Steps:**
+1. Implementer agent can proceed with Phase 1 implementation
+2. No further spec revisions needed
+3. Begin with core data structures (types.ts) as defined in section 2

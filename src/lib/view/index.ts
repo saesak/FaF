@@ -1,0 +1,1 @@
+export { viewSync } from './viewSync';

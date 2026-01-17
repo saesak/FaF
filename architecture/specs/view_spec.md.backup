@@ -1,0 +1,2402 @@
+# View System Specification
+
+## Agent Context
+- **Status**: drafting
+- **Iteration**: 1
+- **Last Agent**: implementer
+- **Last Action**: Wrote full specification
+- **Open Issues**: none
+
+---
+
+## Scope
+Reader view component, Speed view component, view synchronization, progress indicator, empty state, ORP rendering, font size controls.
+
+## Reference
+- See: `SPEC.md` - UI & Theme, Layout, View Sync sections
+- See: `SYSTEM_STATE_MACHINE.md` - VIEW_STATE
+- See: `parser_spec.md` - DocumentModel, ParsedWord, DocumentPosition
+- See: `playback_spec.md` - PlaybackState, currentWord store, progress stores
+
+---
+
+## Plan
+
+### Component Architecture
+
+```
+src/lib/components/
+├── views/
+│   ├── SpeedView.svelte          # RSVP single-word display
+│   ├── ReaderView.svelte         # Full document scrollable view
+│   ├── EmptyState.svelte         # No document loaded state
+│   └── ViewContainer.svelte      # View switcher/orchestrator
+├── speed/
+│   ├── WordDisplay.svelte        # Word with ORP highlighting
+│   ├── ORPRenderer.svelte        # ORP letter positioning
+│   └── ProgressOverlay.svelte    # Progress when paused
+├── reader/
+│   ├── DocumentRenderer.svelte   # Full document display
+│   ├── ParagraphBlock.svelte     # Single paragraph with word spans
+│   ├── ClickableWord.svelte      # Clickable word for position set
+│   ├── ImageBlock.svelte         # Inline image display
+│   └── FontSizeControls.svelte   # +/- font size buttons
+└── empty/
+    ├── RecentFilesList.svelte    # Recent files with positions
+    ├── FileDropZone.svelte       # Drag and drop area
+    └── FilePicker.svelte         # File picker button
+```
+
+### Store Architecture
+
+```typescript
+// src/lib/stores/viewStore.ts
+interface ViewState {
+  activeView: 'speed' | 'reader';
+  fontSize: number;           // Reader view font size (em)
+  highlightedWordIndex: number | null;  // Word to highlight in Reader
+  scrollToIndex: number | null;         // Trigger scroll to word
+}
+
+// src/lib/stores/uiStore.ts
+interface UIState {
+  showProgress: boolean;      // Show progress overlay
+  showControls: boolean;      // Show speed controls
+  dragOver: boolean;          // File drag over state
+}
+```
+
+### Key Algorithms
+
+1. **ORP Rendering**: Position word so ORP letter is at screen center
+2. **View Sync**: Bidirectional sync between Speed View position and Reader View scroll
+3. **Word Click to Position**: Click word in Reader sets playback position
+4. **Progress Calculation**: Percentage and time remaining from playback state
+
+### Integration Points
+
+| System | Integration |
+|--------|-------------|
+| PlaybackEngine | Subscribe to word_changed, state_changed events |
+| DocumentStore | Read document for Reader View rendering |
+| PositionStore | Read saved positions for recent files list |
+| SettingsStore | Read/write font size preference |
+
+---
+
+## Specification
+
+### 1. Overview
+
+#### Purpose
+
+The View System provides the visual interface for FaF, consisting of two mutually exclusive views:
+
+1. **Speed View**: RSVP display showing one word at a time with ORP highlighting
+2. **Reader View**: Full document view with scrolling, images, and word highlighting
+
+The system handles view switching, synchronization between views, progress display, and the empty state when no document is loaded.
+
+#### Role in System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              VIEW SYSTEM                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                         ViewContainer                                   │ │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │ │
+│  │  │   EmptyState    │  │   SpeedView     │  │   ReaderView    │        │ │
+│  │  │                 │  │                 │  │                 │        │ │
+│  │  │ • Recent files  │  │ • WordDisplay   │  │ • Document      │        │ │
+│  │  │ • File picker   │  │ • ORP render    │  │ • Paragraphs    │        │ │
+│  │  │ • Drag-drop     │  │ • Progress      │  │ • Images        │        │ │
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                    │                                         │
+│                                    ▼                                         │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                              Stores                                     │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │ │
+│  │  │  viewStore   │  │   uiStore    │  │ playbackState│                 │ │
+│  │  │              │  │              │  │  (external)  │                 │ │
+│  │  │ • activeView │  │ • showProgress│ │ • currentWord│                 │ │
+│  │  │ • fontSize   │  │ • showControls│ │ • isPlaying  │                 │ │
+│  │  │ • highlight  │  │ • dragOver   │  │ • progress   │                 │ │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘                 │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    Subscribes to   │   Emits to
+                         ▼          │        ▼
+               ┌─────────────────┐  │  ┌─────────────────┐
+               │ PlaybackEngine  │◄─┼─►│   InputSystem   │
+               │                 │  │  │                 │
+               │ • word_changed  │  │  │ • view_toggle   │
+               │ • state_changed │  │  │ • word_click    │
+               └─────────────────┘  │  └─────────────────┘
+```
+
+#### Data Flow
+
+```
+PlaybackEngine                    View System
+     │                                 │
+     │ word_changed event              │
+     ├─────────────────────────────────►
+     │                                 │
+     │                           ┌─────┴─────┐
+     │                           │           │
+     │                    SpeedView    ReaderView
+     │                           │           │
+     │                    Update word   Scroll to
+     │                    display       paragraph
+     │                           │           │
+     │                           └─────┬─────┘
+     │                                 │
+     │ state_changed event             │
+     ├─────────────────────────────────►
+     │                                 │
+     │                           Show/hide
+     │                           progress
+     │                           overlay
+     │                                 │
+     │                                 │
+     │◄────────────────────────────────┤
+     │ jumpTo(index) from word click   │
+```
+
+---
+
+### 2. Data Models
+
+#### ViewState Store
+
+```typescript
+// src/lib/stores/viewStore.ts
+
+import { writable, derived, type Writable, type Readable } from 'svelte/store';
+
+/**
+ * Primary state for the view system.
+ */
+interface ViewState {
+  /**
+   * Currently active view.
+   * 'speed' = RSVP single word display
+   * 'reader' = Full document scroll view
+   */
+  activeView: 'speed' | 'reader';
+
+  /**
+   * Font size for Reader View in em units.
+   * Range: 0.8 to 2.0, step 0.1
+   * Default: 1.0
+   */
+  fontSize: number;
+
+  /**
+   * Word index to highlight in Reader View.
+   * Used when syncing from Speed View.
+   * Null when no highlight active.
+   */
+  highlightedWordIndex: number | null;
+
+  /**
+   * Trigger scroll to specific word index in Reader View.
+   * Set by view sync, cleared after scroll completes.
+   */
+  scrollToIndex: number | null;
+
+  /**
+   * Last position in Speed View when switching to Reader.
+   * Used for resuming in Speed View.
+   */
+  lastSpeedPosition: number;
+}
+
+const DEFAULT_VIEW_STATE: ViewState = {
+  activeView: 'reader',
+  fontSize: 1.0,
+  highlightedWordIndex: null,
+  scrollToIndex: null,
+  lastSpeedPosition: 0
+};
+
+function createViewStore() {
+  const { subscribe, set, update } = writable<ViewState>(DEFAULT_VIEW_STATE);
+
+  return {
+    subscribe,
+
+    /**
+     * Toggle between Speed View and Reader View.
+     * Per SPEC.md: "Any view toggle always auto-pauses"
+     */
+    toggleView(): void {
+      update(state => ({
+        ...state,
+        activeView: state.activeView === 'speed' ? 'reader' : 'speed',
+        // Clear scroll trigger when switching
+        scrollToIndex: null
+      }));
+      // Note: PlaybackEngine handles auto-pause via VIEW_TOGGLE event
+    },
+
+    /**
+     * Switch to specific view.
+     */
+    setActiveView(view: 'speed' | 'reader'): void {
+      update(state => ({
+        ...state,
+        activeView: view,
+        scrollToIndex: null
+      }));
+    },
+
+    /**
+     * Set font size for Reader View.
+     * Clamped to valid range.
+     */
+    setFontSize(size: number): void {
+      const clamped = Math.max(0.8, Math.min(2.0, size));
+      update(state => ({ ...state, fontSize: clamped }));
+      // Persist to settings
+      settingsStore.setFontSize(clamped);
+    },
+
+    /**
+     * Increase font size by 0.1em.
+     */
+    increaseFontSize(): void {
+      update(state => ({
+        ...state,
+        fontSize: Math.min(2.0, state.fontSize + 0.1)
+      }));
+    },
+
+    /**
+     * Decrease font size by 0.1em.
+     */
+    decreaseFontSize(): void {
+      update(state => ({
+        ...state,
+        fontSize: Math.max(0.8, state.fontSize - 0.1)
+      }));
+    },
+
+    /**
+     * Highlight a word in Reader View (from Speed View sync).
+     */
+    highlightWord(index: number | null): void {
+      update(state => ({
+        ...state,
+        highlightedWordIndex: index
+      }));
+    },
+
+    /**
+     * Trigger scroll to word in Reader View.
+     */
+    scrollToWord(index: number): void {
+      update(state => ({
+        ...state,
+        scrollToIndex: index,
+        highlightedWordIndex: index
+      }));
+    },
+
+    /**
+     * Clear scroll trigger after scroll completes.
+     */
+    clearScrollTrigger(): void {
+      update(state => ({
+        ...state,
+        scrollToIndex: null
+      }));
+    },
+
+    /**
+     * Save current speed position before switching views.
+     */
+    saveSpeedPosition(index: number): void {
+      update(state => ({
+        ...state,
+        lastSpeedPosition: index
+      }));
+    },
+
+    /**
+     * Reset view state (on document unload).
+     */
+    reset(): void {
+      set(DEFAULT_VIEW_STATE);
+    }
+  };
+}
+
+export const viewStore = createViewStore();
+
+// Derived stores for convenience
+export const activeView: Readable<'speed' | 'reader'> = derived(
+  viewStore,
+  $state => $state.activeView
+);
+
+export const fontSize: Readable<number> = derived(
+  viewStore,
+  $state => $state.fontSize
+);
+
+export const highlightedWordIndex: Readable<number | null> = derived(
+  viewStore,
+  $state => $state.highlightedWordIndex
+);
+```
+
+#### UIState Store
+
+```typescript
+// src/lib/stores/uiStore.ts
+
+import { writable, derived, type Writable, type Readable } from 'svelte/store';
+
+/**
+ * Transient UI state for view components.
+ */
+interface UIState {
+  /**
+   * Show progress overlay (when paused in Speed View).
+   */
+  showProgress: boolean;
+
+  /**
+   * Show speed controls overlay.
+   */
+  showControls: boolean;
+
+  /**
+   * File is being dragged over drop zone.
+   */
+  dragOver: boolean;
+
+  /**
+   * Error message to display (null = no error).
+   */
+  errorMessage: string | null;
+
+  /**
+   * Loading state for file parsing.
+   */
+  isLoading: boolean;
+}
+
+const DEFAULT_UI_STATE: UIState = {
+  showProgress: false,
+  showControls: false,
+  dragOver: false,
+  errorMessage: null,
+  isLoading: false
+};
+
+function createUIStore() {
+  const { subscribe, set, update } = writable<UIState>(DEFAULT_UI_STATE);
+
+  return {
+    subscribe,
+
+    setShowProgress(show: boolean): void {
+      update(state => ({ ...state, showProgress: show }));
+    },
+
+    setShowControls(show: boolean): void {
+      update(state => ({ ...state, showControls: show }));
+    },
+
+    setDragOver(over: boolean): void {
+      update(state => ({ ...state, dragOver: over }));
+    },
+
+    setError(message: string | null): void {
+      update(state => ({ ...state, errorMessage: message }));
+    },
+
+    setLoading(loading: boolean): void {
+      update(state => ({ ...state, isLoading: loading }));
+    },
+
+    reset(): void {
+      set(DEFAULT_UI_STATE);
+    }
+  };
+}
+
+export const uiStore = createUIStore();
+
+// Derived stores
+export const showProgress: Readable<boolean> = derived(
+  uiStore,
+  $state => $state.showProgress
+);
+
+export const isLoading: Readable<boolean> = derived(
+  uiStore,
+  $state => $state.isLoading
+);
+```
+
+---
+
+### 3. Speed View Components
+
+#### 3.1 SpeedView.svelte
+
+```svelte
+<!-- src/lib/components/views/SpeedView.svelte -->
+<script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
+  import { currentWord, isPlaying, isPaused } from '$lib/stores/playbackStore';
+  import { viewStore } from '$lib/stores/viewStore';
+  import { uiStore } from '$lib/stores/uiStore';
+  import { settingsStore } from '$lib/stores/settingsStore';
+  import WordDisplay from '../speed/WordDisplay.svelte';
+  import ProgressOverlay from '../speed/ProgressOverlay.svelte';
+  import SpeedControls from '../speed/SpeedControls.svelte';
+
+  // Show progress when paused
+  $: showProgress = $isPaused;
+
+  // Colors from settings
+  $: backgroundColor = $settingsStore.colors.background;
+</script>
+
+<div
+  class="speed-view"
+  style="background-color: {backgroundColor};"
+>
+  {#if $currentWord}
+    <WordDisplay word={$currentWord} />
+  {:else}
+    <div class="no-word">
+      <!-- Empty state when no word (shouldn't happen in normal flow) -->
+    </div>
+  {/if}
+
+  {#if showProgress}
+    <ProgressOverlay />
+  {/if}
+</div>
+
+<style>
+  .speed-view {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .no-word {
+    /* Placeholder for edge cases */
+  }
+</style>
+```
+
+#### 3.2 WordDisplay.svelte - ORP Rendering
+
+```svelte
+<!-- src/lib/components/speed/WordDisplay.svelte -->
+<script lang="ts">
+  import { settingsStore } from '$lib/stores/settingsStore';
+  import ORPRenderer from './ORPRenderer.svelte';
+  import type { ParsedWord } from '$lib/parser/types';
+
+  export let word: ParsedWord;
+
+  // Colors from settings
+  $: wordColor = $settingsStore.colors.word;
+  $: orpColor = $settingsStore.colors.orp;
+</script>
+
+<div class="word-display">
+  <ORPRenderer
+    {word}
+    {wordColor}
+    {orpColor}
+  />
+</div>
+
+<style>
+  .word-display {
+    font-family: 'Lexend', sans-serif;
+    font-size: clamp(2rem, 8vw, 4rem);
+    font-weight: 400;
+    user-select: none;
+    white-space: nowrap;
+  }
+</style>
+```
+
+#### 3.3 ORPRenderer.svelte - ORP Positioning Algorithm
+
+The ORP (Optimal Reading Point) renderer positions the word so the ORP letter is at the horizontal center of the viewport.
+
+```svelte
+<!-- src/lib/components/speed/ORPRenderer.svelte -->
+<script lang="ts">
+  import { onMount, afterUpdate, tick } from 'svelte';
+  import type { ParsedWord } from '$lib/parser/types';
+
+  export let word: ParsedWord;
+  export let wordColor: string = '#FFFFFF';
+  export let orpColor: string = '#E53935';
+
+  let containerRef: HTMLDivElement;
+  let wordRef: HTMLSpanElement;
+  let offsetX: number = 0;
+
+  /**
+   * Calculate horizontal offset to center ORP letter.
+   *
+   * Algorithm:
+   * 1. Get width of characters before ORP
+   * 2. Get width of ORP character / 2
+   * 3. Offset = -(beforeWidth + orpHalfWidth - containerWidth/2)
+   */
+  async function calculateOffset() {
+    await tick();
+
+    if (!containerRef || !wordRef) return;
+
+    const containerWidth = containerRef.clientWidth;
+    const orpIndex = word.orp;
+    const text = word.text;
+
+    // Create temporary spans to measure character widths
+    const measureContainer = document.createElement('div');
+    measureContainer.style.cssText = `
+      position: absolute;
+      visibility: hidden;
+      font-family: 'Lexend', sans-serif;
+      font-size: ${getComputedStyle(wordRef).fontSize};
+      white-space: nowrap;
+    `;
+    document.body.appendChild(measureContainer);
+
+    // Measure text before ORP
+    const beforeText = text.slice(0, orpIndex);
+    measureContainer.textContent = beforeText;
+    const beforeWidth = measureContainer.clientWidth;
+
+    // Measure ORP character
+    measureContainer.textContent = text[orpIndex];
+    const orpWidth = measureContainer.clientWidth;
+
+    document.body.removeChild(measureContainer);
+
+    // Calculate offset to center ORP
+    const orpCenterFromStart = beforeWidth + (orpWidth / 2);
+    const containerCenter = containerWidth / 2;
+    offsetX = containerCenter - orpCenterFromStart;
+  }
+
+  onMount(() => {
+    calculateOffset();
+    window.addEventListener('resize', calculateOffset);
+    return () => window.removeEventListener('resize', calculateOffset);
+  });
+
+  afterUpdate(() => {
+    calculateOffset();
+  });
+
+  // Split word into parts for rendering
+  $: beforeORP = word.text.slice(0, word.orp);
+  $: orpChar = word.text[word.orp];
+  $: afterORP = word.text.slice(word.orp + 1);
+</script>
+
+<div class="orp-container" bind:this={containerRef}>
+  <span
+    class="word-text"
+    bind:this={wordRef}
+    style="transform: translateX({offsetX}px);"
+  >
+    <span class="before" style="color: {wordColor};">{beforeORP}</span>
+    <span class="orp" style="color: {orpColor};">{orpChar}</span>
+    <span class="after" style="color: {wordColor};">{afterORP}</span>
+  </span>
+
+  <!-- Visual center marker (for development, remove in production) -->
+  <!-- <div class="center-marker"></div> -->
+</div>
+
+<style>
+  .orp-container {
+    position: relative;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    overflow: visible;
+  }
+
+  .word-text {
+    display: inline-block;
+    transition: transform 0.05s ease-out;
+  }
+
+  .orp {
+    font-weight: 500;
+  }
+
+  /* Development marker - remove for production
+  .center-marker {
+    position: absolute;
+    top: -20px;
+    left: 50%;
+    width: 2px;
+    height: 10px;
+    background: rgba(255, 255, 255, 0.3);
+    transform: translateX(-50%);
+  }
+  */
+</style>
+```
+
+#### ORP Positioning Algorithm - Detailed Explanation
+
+```typescript
+/**
+ * ORP Positioning Algorithm
+ *
+ * Goal: Position the word so the ORP (Optimal Reading Point) letter
+ * is exactly at the horizontal center of the viewport.
+ *
+ * The ORP index comes from the parser based on word length:
+ * - Length 1-2:  ORP at position 0
+ * - Length 3-6:  ORP at position 1
+ * - Length 7-10: ORP at position 2
+ * - Length 11-13: ORP at position 3
+ * - Length 14+:  ORP at position 4
+ *
+ * Example: "reading" (7 chars)
+ * - ORP index: 2 (the 'a')
+ * - Display: "re[A]ding" where [A] is centered and red
+ *
+ * Calculation:
+ *
+ *     Container center
+ *           |
+ *           v
+ * |---------|---------|
+ * |         |         |
+ * |    re[A]ding      |  <- Word needs to shift left
+ * |         |         |
+ * |---------|---------|
+ *
+ * beforeWidth = width of "re"
+ * orpWidth = width of "A"
+ * orpCenter = beforeWidth + (orpWidth / 2)
+ * containerCenter = containerWidth / 2
+ * offset = containerCenter - orpCenter
+ *
+ * Positive offset = shift right (ORP was left of center)
+ * Negative offset = shift left (ORP was right of center)
+ */
+
+function calculateORPOffset(
+  word: string,
+  orpIndex: number,
+  measureFn: (text: string) => number,
+  containerWidth: number
+): number {
+  const beforeWidth = measureFn(word.slice(0, orpIndex));
+  const orpWidth = measureFn(word[orpIndex]);
+
+  const orpCenter = beforeWidth + (orpWidth / 2);
+  const containerCenter = containerWidth / 2;
+
+  return containerCenter - orpCenter;
+}
+```
+
+#### 3.4 ProgressOverlay.svelte
+
+```svelte
+<!-- src/lib/components/speed/ProgressOverlay.svelte -->
+<script lang="ts">
+  import { progress, timeRemainingFormatted, wpm } from '$lib/stores/playbackStore';
+  import { fade } from 'svelte/transition';
+  import SpeedControls from './SpeedControls.svelte';
+
+  // Format progress percentage
+  $: progressText = `${$progress}%`;
+</script>
+
+<div class="progress-overlay" transition:fade={{ duration: 150 }}>
+  <div class="progress-info">
+    <div class="progress-bar-container">
+      <div class="progress-bar" style="width: {$progress}%"></div>
+    </div>
+
+    <div class="stats">
+      <span class="percentage">{progressText}</span>
+      <span class="separator">-</span>
+      <span class="time-remaining">{$timeRemainingFormatted} remaining</span>
+    </div>
+  </div>
+
+  <SpeedControls />
+</div>
+
+<style>
+  .progress-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 1.5rem;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.3));
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .progress-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .progress-bar-container {
+    width: 100%;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .progress-bar {
+    height: 100%;
+    background: #E53935;
+    transition: width 0.3s ease;
+  }
+
+  .stats {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .percentage {
+    font-weight: 500;
+  }
+
+  .separator {
+    opacity: 0.5;
+  }
+</style>
+```
+
+#### 3.5 SpeedControls.svelte
+
+```svelte
+<!-- src/lib/components/speed/SpeedControls.svelte -->
+<script lang="ts">
+  import { wpm } from '$lib/stores/playbackStore';
+  import { playbackEngine } from '$lib/playback/playbackEngine';
+
+  function decreaseSpeed() {
+    playbackEngine.adjustWpm('down');
+  }
+
+  function increaseSpeed() {
+    playbackEngine.adjustWpm('up');
+  }
+</script>
+
+<div class="speed-controls">
+  <button
+    class="speed-btn decrease"
+    on:click={decreaseSpeed}
+    aria-label="Decrease reading speed"
+  >
+    -
+  </button>
+
+  <div class="wpm-display">
+    <span class="wpm-value">{$wpm}</span>
+    <span class="wpm-label">WPM</span>
+  </div>
+
+  <button
+    class="speed-btn increase"
+    on:click={increaseSpeed}
+    aria-label="Increase reading speed"
+  >
+    +
+  </button>
+</div>
+
+<style>
+  .speed-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+  }
+
+  .speed-btn {
+    width: 44px;
+    height: 44px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    background: transparent;
+    color: white;
+    font-size: 1.5rem;
+    font-family: 'Lexend', sans-serif;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .speed-btn:hover {
+    border-color: rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  .speed-btn:active {
+    transform: scale(0.95);
+  }
+
+  .wpm-display {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 80px;
+  }
+
+  .wpm-value {
+    font-family: 'Lexend', sans-serif;
+    font-size: 1.5rem;
+    font-weight: 500;
+    color: white;
+  }
+
+  .wpm-label {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.6);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+</style>
+```
+
+---
+
+### 4. Reader View Components
+
+#### 4.1 ReaderView.svelte
+
+```svelte
+<!-- src/lib/components/views/ReaderView.svelte -->
+<script lang="ts">
+  import { onMount, onDestroy, afterUpdate, tick } from 'svelte';
+  import { currentDocument } from '$lib/stores/documentStore';
+  import { viewStore, highlightedWordIndex, fontSize } from '$lib/stores/viewStore';
+  import { settingsStore } from '$lib/stores/settingsStore';
+  import DocumentRenderer from '../reader/DocumentRenderer.svelte';
+  import FontSizeControls from '../reader/FontSizeControls.svelte';
+
+  let scrollContainer: HTMLDivElement;
+  let unsubscribe: (() => void) | null = null;
+
+  // Handle scroll to word requests
+  $: {
+    const scrollToIndex = $viewStore.scrollToIndex;
+    if (scrollToIndex !== null && scrollContainer) {
+      scrollToWord(scrollToIndex);
+    }
+  }
+
+  async function scrollToWord(wordIndex: number) {
+    await tick();
+
+    const wordElement = scrollContainer.querySelector(
+      `[data-word-index="${wordIndex}"]`
+    );
+
+    if (wordElement) {
+      wordElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center'
+      });
+
+      // Clear the scroll trigger
+      viewStore.clearScrollTrigger();
+    }
+  }
+
+  // Colors from settings
+  $: backgroundColor = $settingsStore.colors.background;
+  $: textColor = $settingsStore.colors.word;
+</script>
+
+<div
+  class="reader-view"
+  bind:this={scrollContainer}
+  style="background-color: {backgroundColor}; color: {textColor}; font-size: {$fontSize}em;"
+>
+  {#if $currentDocument}
+    <div class="document-content">
+      <DocumentRenderer
+        document={$currentDocument}
+        highlightedIndex={$highlightedWordIndex}
+      />
+    </div>
+  {/if}
+
+  <FontSizeControls />
+</div>
+
+<style>
+  .reader-view {
+    width: 100%;
+    height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    position: relative;
+    font-family: 'Lexend', sans-serif;
+    line-height: 1.7;
+  }
+
+  .document-content {
+    max-width: 65ch;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+</style>
+```
+
+#### 4.2 DocumentRenderer.svelte
+
+```svelte
+<!-- src/lib/components/reader/DocumentRenderer.svelte -->
+<script lang="ts">
+  import type { DocumentModel, RawContent, Paragraph, Chapter, PdfPage } from '$lib/parser/types';
+  import ParagraphBlock from './ParagraphBlock.svelte';
+  import ImageBlock from './ImageBlock.svelte';
+
+  export let document: DocumentModel;
+  export let highlightedIndex: number | null = null;
+
+  // Get paragraphs based on document type
+  function getParagraphs(): { paragraph: Paragraph; pageIndex?: number }[] {
+    const content = document.rawContent;
+
+    if (content.type === 'txt') {
+      return content.paragraphs.map(p => ({ paragraph: p }));
+    }
+
+    if (content.type === 'epub') {
+      const result: { paragraph: Paragraph; pageIndex?: number }[] = [];
+      content.chapters.forEach((chapter, chapterIndex) => {
+        chapter.paragraphs.forEach(p => {
+          result.push({ paragraph: p, pageIndex: chapterIndex });
+        });
+      });
+      return result;
+    }
+
+    if (content.type === 'pdf') {
+      const result: { paragraph: Paragraph; pageIndex?: number }[] = [];
+      content.pages.forEach((page, pageIndex) => {
+        page.paragraphs.forEach(p => {
+          result.push({ paragraph: p, pageIndex });
+        });
+      });
+      return result;
+    }
+
+    return [];
+  }
+
+  $: paragraphs = getParagraphs();
+</script>
+
+<div class="document-renderer">
+  <!-- Document title -->
+  <h1 class="document-title">{document.metadata.title}</h1>
+
+  {#if document.metadata.author}
+    <p class="document-author">by {document.metadata.author}</p>
+  {/if}
+
+  <div class="document-body">
+    {#each paragraphs as { paragraph }, index}
+      <ParagraphBlock
+        {paragraph}
+        words={document.words}
+        {highlightedIndex}
+        paragraphIndex={index}
+      />
+    {/each}
+  </div>
+</div>
+
+<style>
+  .document-renderer {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .document-title {
+    font-size: 1.75em;
+    font-weight: 600;
+    margin: 0 0 0.5rem 0;
+    line-height: 1.3;
+  }
+
+  .document-author {
+    font-size: 0.9em;
+    opacity: 0.7;
+    margin: 0 0 2rem 0;
+  }
+
+  .document-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25em;
+  }
+</style>
+```
+
+#### 4.3 ParagraphBlock.svelte
+
+```svelte
+<!-- src/lib/components/reader/ParagraphBlock.svelte -->
+<script lang="ts">
+  import type { Paragraph, ParsedWord } from '$lib/parser/types';
+  import ClickableWord from './ClickableWord.svelte';
+
+  export let paragraph: Paragraph;
+  export let words: ParsedWord[];
+  export let highlightedIndex: number | null;
+  export let paragraphIndex: number;
+
+  // Get words for this paragraph
+  $: paragraphWords = words.slice(paragraph.startWordIndex, paragraph.endWordIndex + 1);
+</script>
+
+<p class="paragraph-block" data-paragraph-index={paragraphIndex}>
+  {#each paragraphWords as word, i}
+    <ClickableWord
+      {word}
+      wordIndex={paragraph.startWordIndex + i}
+      isHighlighted={highlightedIndex === paragraph.startWordIndex + i}
+    />
+    {' '}
+  {/each}
+</p>
+
+<style>
+  .paragraph-block {
+    margin: 0;
+    text-align: left;
+  }
+</style>
+```
+
+#### 4.4 ClickableWord.svelte
+
+```svelte
+<!-- src/lib/components/reader/ClickableWord.svelte -->
+<script lang="ts">
+  import { createEventDispatcher } from 'svelte';
+  import { playbackEngine } from '$lib/playback/playbackEngine';
+  import { viewStore } from '$lib/stores/viewStore';
+  import type { ParsedWord } from '$lib/parser/types';
+
+  export let word: ParsedWord;
+  export let wordIndex: number;
+  export let isHighlighted: boolean = false;
+
+  const dispatch = createEventDispatcher();
+
+  /**
+   * Handle word click.
+   * Per SPEC.md: "Click word in Reader - Set new start point (does NOT auto-play)"
+   */
+  function handleClick() {
+    // Set playback position to this word
+    playbackEngine.jumpTo(wordIndex);
+
+    // Highlight this word
+    viewStore.highlightWord(wordIndex);
+
+    // Emit event for any additional handling
+    dispatch('wordClick', { wordIndex, word });
+  }
+
+  /**
+   * Handle keyboard activation.
+   */
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleClick();
+    }
+  }
+</script>
+
+<span
+  class="clickable-word"
+  class:highlighted={isHighlighted}
+  data-word-index={wordIndex}
+  on:click={handleClick}
+  on:keydown={handleKeyDown}
+  tabindex="0"
+  role="button"
+  aria-label="Set reading position to: {word.text}"
+>
+  {word.text}
+</span>
+
+<style>
+  .clickable-word {
+    cursor: pointer;
+    border-radius: 2px;
+    padding: 0 1px;
+    margin: 0 -1px;
+    transition: background-color 0.15s ease;
+  }
+
+  .clickable-word:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .clickable-word:focus {
+    outline: 2px solid rgba(229, 57, 53, 0.5);
+    outline-offset: 1px;
+  }
+
+  .clickable-word.highlighted {
+    background-color: rgba(229, 57, 53, 0.3);
+  }
+</style>
+```
+
+#### 4.5 FontSizeControls.svelte
+
+```svelte
+<!-- src/lib/components/reader/FontSizeControls.svelte -->
+<script lang="ts">
+  import { viewStore, fontSize } from '$lib/stores/viewStore';
+  import { fade } from 'svelte/transition';
+
+  let visible = true;
+  let hideTimeout: ReturnType<typeof setTimeout>;
+
+  function showControls() {
+    visible = true;
+    clearTimeout(hideTimeout);
+    hideTimeout = setTimeout(() => {
+      visible = false;
+    }, 3000);
+  }
+
+  function increase() {
+    viewStore.increaseFontSize();
+    showControls();
+  }
+
+  function decrease() {
+    viewStore.decreaseFontSize();
+    showControls();
+  }
+
+  // Show on mount
+  showControls();
+</script>
+
+{#if visible}
+  <div class="font-size-controls" transition:fade={{ duration: 150 }}>
+    <button
+      class="size-btn"
+      on:click={decrease}
+      disabled={$fontSize <= 0.8}
+      aria-label="Decrease font size"
+    >
+      A-
+    </button>
+
+    <span class="size-indicator">{Math.round($fontSize * 100)}%</span>
+
+    <button
+      class="size-btn"
+      on:click={increase}
+      disabled={$fontSize >= 2.0}
+      aria-label="Increase font size"
+    >
+      A+
+    </button>
+  </div>
+{/if}
+
+<style>
+  .font-size-controls {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(0, 0, 0, 0.7);
+    padding: 0.5rem;
+    border-radius: 8px;
+    backdrop-filter: blur(8px);
+  }
+
+  .size-btn {
+    width: 36px;
+    height: 36px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.1);
+    color: white;
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .size-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  .size-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+
+  .size-indicator {
+    min-width: 48px;
+    text-align: center;
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.8);
+  }
+</style>
+```
+
+---
+
+### 5. Empty State Components
+
+#### 5.1 EmptyState.svelte
+
+```svelte
+<!-- src/lib/components/views/EmptyState.svelte -->
+<script lang="ts">
+  import { recentStore } from '$lib/stores/recentStore';
+  import { uiStore } from '$lib/stores/uiStore';
+  import RecentFilesList from '../empty/RecentFilesList.svelte';
+  import FileDropZone from '../empty/FileDropZone.svelte';
+  import FilePicker from '../empty/FilePicker.svelte';
+
+  $: hasRecentFiles = $recentStore.files.length > 0;
+  $: dragOver = $uiStore.dragOver;
+</script>
+
+<div class="empty-state" class:drag-over={dragOver}>
+  <FileDropZone>
+    <div class="content">
+      <div class="logo">
+        <span class="logo-text">FaF</span>
+        <span class="logo-subtitle">Fast as Fuck</span>
+      </div>
+
+      <div class="actions">
+        <FilePicker />
+
+        <p class="or-text">or drag and drop a file</p>
+
+        <p class="supported-formats">
+          Supports: TXT, EPUB, PDF (max 50MB)
+        </p>
+      </div>
+
+      {#if hasRecentFiles}
+        <RecentFilesList />
+      {/if}
+
+      <blockquote class="quote">
+        "The habit that keeps people from speedreading is their habit to
+        pronounce words in their head when they read them. Keep the voice
+        out of your head, and let the eyes do the work."
+      </blockquote>
+    </div>
+  </FileDropZone>
+</div>
+
+<style>
+  .empty-state {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #38393d;
+    transition: background-color 0.2s ease;
+  }
+
+  .empty-state.drag-over {
+    background-color: #454650;
+  }
+
+  .content {
+    max-width: 480px;
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2rem;
+  }
+
+  .logo {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .logo-text {
+    font-family: 'Lexend', sans-serif;
+    font-size: 3rem;
+    font-weight: 700;
+    color: #E53935;
+    letter-spacing: -0.02em;
+  }
+
+  .logo-subtitle {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+  }
+
+  .actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .or-text {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.5);
+    margin: 0;
+  }
+
+  .supported-formats {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.3);
+    margin: 0;
+  }
+
+  .quote {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    font-style: italic;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: center;
+    line-height: 1.6;
+    max-width: 400px;
+    margin: 1rem 0 0 0;
+    padding: 0 1rem;
+    border-left: 2px solid rgba(255, 255, 255, 0.2);
+  }
+</style>
+```
+
+#### 5.2 RecentFilesList.svelte
+
+```svelte
+<!-- src/lib/components/empty/RecentFilesList.svelte -->
+<script lang="ts">
+  import { recentStore, type RecentFile } from '$lib/stores/recentStore';
+  import { documentStore } from '$lib/stores/documentStore';
+
+  async function openFile(file: RecentFile) {
+    // Load file from path
+    // The persistence system handles file access via Tauri/Capacitor
+    await documentStore.loadFromPath(file.path);
+  }
+
+  function formatDate(timestamp: number): string {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    return date.toLocaleDateString();
+  }
+
+  function formatProgress(position: number, total: number): string {
+    if (total === 0) return '0%';
+    const percent = Math.round((position / total) * 100);
+    return `${percent}%`;
+  }
+
+  function getFileIcon(type: string): string {
+    switch (type) {
+      case 'pdf': return 'PDF';
+      case 'epub': return 'EPUB';
+      default: return 'TXT';
+    }
+  }
+
+  $: files = $recentStore.files.slice(0, 5); // Show max 5 recent files
+</script>
+
+<div class="recent-files">
+  <h2 class="section-title">Recent Files</h2>
+
+  <ul class="file-list">
+    {#each files as file}
+      <li>
+        <button
+          class="file-item"
+          on:click={() => openFile(file)}
+        >
+          <span class="file-icon">{getFileIcon(file.type)}</span>
+          <div class="file-info">
+            <span class="file-title">{file.title}</span>
+            <span class="file-meta">
+              {formatProgress(file.position, file.totalWords)} - {formatDate(file.lastOpened)}
+            </span>
+          </div>
+        </button>
+      </li>
+    {/each}
+  </ul>
+</div>
+
+<style>
+  .recent-files {
+    width: 100%;
+  }
+
+  .section-title {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 0 0 0.75rem 0;
+  }
+
+  .file-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .file-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-align: left;
+  }
+
+  .file-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  .file-icon {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: #E53935;
+    background: rgba(229, 57, 53, 0.2);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+  }
+
+  .file-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    min-width: 0;
+  }
+
+  .file-title {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: white;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .file-meta {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.4);
+  }
+</style>
+```
+
+#### 5.3 FileDropZone.svelte
+
+```svelte
+<!-- src/lib/components/empty/FileDropZone.svelte -->
+<script lang="ts">
+  import { uiStore } from '$lib/stores/uiStore';
+  import { documentStore } from '$lib/stores/documentStore';
+
+  let dropZoneRef: HTMLDivElement;
+
+  function handleDragEnter(event: DragEvent) {
+    event.preventDefault();
+    uiStore.setDragOver(true);
+  }
+
+  function handleDragLeave(event: DragEvent) {
+    event.preventDefault();
+    // Only set false if leaving the drop zone entirely
+    if (!dropZoneRef.contains(event.relatedTarget as Node)) {
+      uiStore.setDragOver(false);
+    }
+  }
+
+  function handleDragOver(event: DragEvent) {
+    event.preventDefault();
+    // Set drop effect
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  }
+
+  async function handleDrop(event: DragEvent) {
+    event.preventDefault();
+    uiStore.setDragOver(false);
+
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      await documentStore.load(file);
+    }
+  }
+</script>
+
+<div
+  class="drop-zone"
+  bind:this={dropZoneRef}
+  on:dragenter={handleDragEnter}
+  on:dragleave={handleDragLeave}
+  on:dragover={handleDragOver}
+  on:drop={handleDrop}
+>
+  <slot />
+</div>
+
+<style>
+  .drop-zone {
+    width: 100%;
+    height: 100%;
+  }
+</style>
+```
+
+#### 5.4 FilePicker.svelte
+
+```svelte
+<!-- src/lib/components/empty/FilePicker.svelte -->
+<script lang="ts">
+  import { documentStore } from '$lib/stores/documentStore';
+
+  let fileInput: HTMLInputElement;
+
+  function openFilePicker() {
+    fileInput.click();
+  }
+
+  async function handleFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+
+    if (file) {
+      await documentStore.load(file);
+    }
+
+    // Reset input for re-selection of same file
+    input.value = '';
+  }
+</script>
+
+<input
+  type="file"
+  accept=".txt,.text,.epub,.pdf,text/plain,application/epub+zip,application/pdf"
+  bind:this={fileInput}
+  on:change={handleFileSelect}
+  class="hidden-input"
+/>
+
+<button class="pick-btn" on:click={openFilePicker}>
+  Open a file
+</button>
+
+<style>
+  .hidden-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .pick-btn {
+    font-family: 'Lexend', sans-serif;
+    font-size: 1rem;
+    font-weight: 500;
+    color: white;
+    background: #E53935;
+    border: none;
+    padding: 0.875rem 2rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .pick-btn:hover {
+    background: #d32f2f;
+    transform: translateY(-1px);
+  }
+
+  .pick-btn:active {
+    transform: translateY(0);
+  }
+</style>
+```
+
+---
+
+### 6. View Container / Orchestrator
+
+#### 6.1 ViewContainer.svelte
+
+```svelte
+<!-- src/lib/components/views/ViewContainer.svelte -->
+<script lang="ts">
+  import { currentDocument, isLoading, parseError } from '$lib/stores/documentStore';
+  import { viewStore, activeView } from '$lib/stores/viewStore';
+  import { playbackEngine } from '$lib/playback/playbackEngine';
+  import SpeedView from './SpeedView.svelte';
+  import ReaderView from './ReaderView.svelte';
+  import EmptyState from './EmptyState.svelte';
+  import LoadingState from './LoadingState.svelte';
+  import ErrorState from './ErrorState.svelte';
+
+  // Determine which view to show
+  $: hasDocument = $currentDocument !== null;
+  $: showEmpty = !hasDocument && !$isLoading && !$parseError;
+  $: showLoading = $isLoading;
+  $: showError = $parseError !== null;
+  $: showDocument = hasDocument && !$isLoading && !$parseError;
+</script>
+
+<div class="view-container">
+  {#if showLoading}
+    <LoadingState />
+  {:else if showError}
+    <ErrorState error={$parseError} />
+  {:else if showEmpty}
+    <EmptyState />
+  {:else if showDocument}
+    {#if $activeView === 'speed'}
+      <SpeedView />
+    {:else}
+      <ReaderView />
+    {/if}
+  {/if}
+</div>
+
+<style>
+  .view-container {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+</style>
+```
+
+#### 6.2 LoadingState.svelte
+
+```svelte
+<!-- src/lib/components/views/LoadingState.svelte -->
+<script lang="ts">
+  import { fade } from 'svelte/transition';
+</script>
+
+<div class="loading-state" transition:fade={{ duration: 150 }}>
+  <div class="spinner"></div>
+  <p class="loading-text">Loading document...</p>
+</div>
+
+<style>
+  .loading-state {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    background-color: #38393d;
+  }
+
+  .spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid rgba(255, 255, 255, 0.1);
+    border-top-color: #E53935;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .loading-text {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.6);
+    margin: 0;
+  }
+</style>
+```
+
+#### 6.3 ErrorState.svelte
+
+```svelte
+<!-- src/lib/components/views/ErrorState.svelte -->
+<script lang="ts">
+  import { documentStore } from '$lib/stores/documentStore';
+  import type { ParseError } from '$lib/parser/types';
+
+  export let error: ParseError;
+
+  function dismiss() {
+    documentStore.dismissError();
+  }
+</script>
+
+<div class="error-state">
+  <div class="error-content">
+    <div class="error-icon">!</div>
+    <h2 class="error-title">Unable to open file</h2>
+    <p class="error-message">{error.message}</p>
+    <button class="dismiss-btn" on:click={dismiss}>
+      Try another file
+    </button>
+  </div>
+</div>
+
+<style>
+  .error-state {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #38393d;
+  }
+
+  .error-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    max-width: 400px;
+    padding: 2rem;
+    text-align: center;
+  }
+
+  .error-icon {
+    width: 48px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(229, 57, 53, 0.2);
+    color: #E53935;
+    font-family: 'Lexend', sans-serif;
+    font-size: 1.5rem;
+    font-weight: 700;
+    border-radius: 50%;
+  }
+
+  .error-title {
+    font-family: 'Lexend', sans-serif;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: white;
+    margin: 0;
+  }
+
+  .error-message {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    color: rgba(255, 255, 255, 0.6);
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .dismiss-btn {
+    font-family: 'Lexend', sans-serif;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: white;
+    background: rgba(255, 255, 255, 0.1);
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    margin-top: 0.5rem;
+  }
+
+  .dismiss-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+  }
+</style>
+```
+
+---
+
+### 7. View Sync Algorithms
+
+#### 7.1 View Sync Behavior Table (from SPEC.md)
+
+| Action | Behavior |
+|--------|----------|
+| Speed -> Reader | Jump to current paragraph, highlight word with subtle background |
+| Reader -> Speed | Resume from last speed-read position |
+| Click word in Reader | Set new start point (does NOT auto-play) |
+| Any view toggle | **Always auto-pauses** |
+
+#### 7.2 View Sync Implementation
+
+```typescript
+// src/lib/view/viewSync.ts
+
+import { get } from 'svelte/store';
+import { viewStore } from '$lib/stores/viewStore';
+import { playbackState, currentWord } from '$lib/stores/playbackStore';
+import { playbackEngine } from '$lib/playback/playbackEngine';
+
+/**
+ * View synchronization manager.
+ * Handles bidirectional sync between Speed View and Reader View.
+ */
+class ViewSyncManager {
+  private unsubscribePlayback: (() => void) | null = null;
+
+  /**
+   * Initialize view sync subscriptions.
+   */
+  initialize(): void {
+    // Subscribe to playback state changes
+    this.unsubscribePlayback = playbackState.subscribe(state => {
+      this.handlePlaybackStateChange(state);
+    });
+  }
+
+  /**
+   * Handle playback state changes for view sync.
+   */
+  private handlePlaybackStateChange(state: PlaybackState): void {
+    const view = get(viewStore);
+
+    // Update highlight in Reader View when word changes
+    if (view.activeView === 'reader' && state.status === 'paused') {
+      viewStore.highlightWord(state.currentWordIndex);
+    }
+  }
+
+  /**
+   * Handle view toggle from Speed View to Reader View.
+   *
+   * Per SPEC.md: "Speed -> Reader: Jump to current paragraph,
+   * highlight word with subtle background"
+   */
+  handleSpeedToReader(): void {
+    const state = get(playbackState);
+    const currentIndex = state.currentWordIndex;
+
+    // Save current position for return
+    viewStore.saveSpeedPosition(currentIndex);
+
+    // Trigger scroll to current word and highlight it
+    viewStore.scrollToWord(currentIndex);
+
+    // Switch view
+    viewStore.setActiveView('reader');
+
+    // Auto-pause (handled by playback engine via VIEW_TOGGLE event)
+    playbackEngine.handleViewToggle();
+  }
+
+  /**
+   * Handle view toggle from Reader View to Speed View.
+   *
+   * Per SPEC.md: "Reader -> Speed: Resume from last speed-read position"
+   */
+  handleReaderToSpeed(): void {
+    const view = get(viewStore);
+
+    // Clear highlight
+    viewStore.highlightWord(null);
+
+    // Switch view
+    viewStore.setActiveView('speed');
+
+    // Auto-pause (handled by playback engine)
+    playbackEngine.handleViewToggle();
+  }
+
+  /**
+   * Handle word click in Reader View.
+   *
+   * Per SPEC.md: "Click word in Reader: Set new start point
+   * (does NOT auto-play)"
+   */
+  handleWordClick(wordIndex: number): void {
+    // Set playback position
+    playbackEngine.jumpTo(wordIndex);
+
+    // Highlight the clicked word
+    viewStore.highlightWord(wordIndex);
+
+    // Update saved speed position
+    viewStore.saveSpeedPosition(wordIndex);
+
+    // Note: Does NOT auto-play, per spec
+  }
+
+  /**
+   * Toggle between views.
+   * Called by Tab key or swipe gesture.
+   */
+  toggleView(): void {
+    const view = get(viewStore);
+
+    if (view.activeView === 'speed') {
+      this.handleSpeedToReader();
+    } else {
+      this.handleReaderToSpeed();
+    }
+  }
+
+  /**
+   * Cleanup subscriptions.
+   */
+  destroy(): void {
+    if (this.unsubscribePlayback) {
+      this.unsubscribePlayback();
+    }
+  }
+}
+
+export const viewSync = new ViewSyncManager();
+```
+
+#### 7.3 Scroll to Word Algorithm
+
+```typescript
+/**
+ * Scroll to Word Algorithm
+ *
+ * When switching from Speed View to Reader View, we need to:
+ * 1. Find the DOM element for the current word
+ * 2. Scroll it into view, centered vertically
+ * 3. Apply highlight styling
+ *
+ * Implementation uses data attributes for efficient lookup:
+ * - Each word span has data-word-index="N"
+ * - Use querySelector to find the element
+ * - Use scrollIntoView with smooth behavior
+ */
+
+async function scrollToWordInReaderView(
+  scrollContainer: HTMLElement,
+  wordIndex: number
+): Promise<void> {
+  // Wait for DOM to update
+  await tick();
+
+  // Find word element by data attribute
+  const wordElement = scrollContainer.querySelector(
+    `[data-word-index="${wordIndex}"]`
+  );
+
+  if (!wordElement) {
+    console.warn(`Word element not found for index ${wordIndex}`);
+    return;
+  }
+
+  // Scroll into view with smooth animation
+  wordElement.scrollIntoView({
+    behavior: 'smooth',
+    block: 'center',  // Center vertically
+    inline: 'nearest'
+  });
+}
+```
+
+---
+
+### 8. Progress Calculations
+
+#### 8.1 Progress Store Derivations
+
+```typescript
+// These are defined in playback_spec.md but shown here for context
+
+/**
+ * Progress percentage (0-100).
+ */
+export const progress: Readable<number> = derived(
+  playbackState,
+  ($state) => {
+    if ($state.totalWords === 0) return 0;
+    return Math.round(($state.currentWordIndex / $state.totalWords) * 100);
+  }
+);
+
+/**
+ * Time remaining in seconds.
+ * Uses current WPM and remaining word count.
+ */
+export const timeRemaining: Readable<number> = derived(
+  playbackState,
+  ($state) => {
+    const remaining = $state.totalWords - $state.currentWordIndex;
+    if (remaining <= 0 || $state.wpm <= 0) return 0;
+
+    // Basic calculation: remaining words / words per minute * 60 seconds
+    // Does not account for punctuation pauses (approximation)
+    return Math.ceil((remaining / $state.wpm) * 60);
+  }
+);
+
+/**
+ * Formatted time remaining string.
+ * Format: "M:SS" (e.g., "5:32")
+ */
+export const timeRemainingFormatted: Readable<string> = derived(
+  timeRemaining,
+  ($seconds) => {
+    const mins = Math.floor($seconds / 60);
+    const secs = $seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+);
+```
+
+#### 8.2 Progress Display Logic
+
+```typescript
+/**
+ * Progress is shown only when paused.
+ *
+ * Per SPEC.md: "Progress Indicator: Visible only when paused -
+ * shows percentage and estimated time remaining."
+ *
+ * The SpeedView component shows ProgressOverlay when:
+ * - isPaused is true
+ * - A document is loaded
+ */
+
+// In SpeedView.svelte
+$: showProgress = $isPaused && $hasDocument;
+```
+
+---
+
+### 9. Integration with Playback Engine
+
+#### 9.1 Event Subscriptions
+
+```typescript
+// src/lib/view/viewIntegration.ts
+
+import { onMount, onDestroy } from 'svelte';
+import { playbackEngine, type PlaybackEvent } from '$lib/playback/playbackEngine';
+import { viewStore } from '$lib/stores/viewStore';
+import { uiStore } from '$lib/stores/uiStore';
+
+/**
+ * Set up view system integration with playback engine.
+ * Call this in the root layout or app component.
+ */
+export function setupViewIntegration(): () => void {
+  const unsubscribe = playbackEngine.on((event: PlaybackEvent) => {
+    handlePlaybackEvent(event);
+  });
+
+  return unsubscribe;
+}
+
+function handlePlaybackEvent(event: PlaybackEvent): void {
+  switch (event.type) {
+    case 'word_changed':
+      // Update highlight in Reader View if visible
+      // (Handled by subscription in viewSync)
+      break;
+
+    case 'state_changed':
+      // Update UI based on play/pause state
+      if (event.state.status === 'paused') {
+        uiStore.setShowProgress(true);
+      } else {
+        uiStore.setShowProgress(false);
+      }
+      break;
+
+    case 'end_of_document':
+      // Show completion feedback
+      uiStore.setShowProgress(true);
+      break;
+
+    case 'wpm_changed':
+      // WPM display updates automatically via store subscription
+      break;
+  }
+}
+```
+
+#### 9.2 View Toggle Integration
+
+```typescript
+// In input handler or view components
+
+function handleViewToggle(): void {
+  // Notify playback engine (causes auto-pause)
+  playbackEngine.handleViewToggle();
+
+  // Toggle the view
+  viewSync.toggleView();
+}
+
+// Playback engine implementation
+class PlaybackEngine {
+  handleViewToggle(): void {
+    // Per SPEC.md: "Any view toggle always auto-pauses"
+    if (this.state.status === 'playing') {
+      this.pause();
+      this.emit({ type: 'auto_paused', reason: 'view_toggle' });
+    }
+  }
+}
+```
+
+---
+
+### 10. Edge Cases and Error Handling
+
+#### 10.1 Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| Empty document | Show EmptyState, disable view toggle |
+| Single word document | Normal display, progress shows 100% after first word |
+| Very long word (30+ chars) | Full word displayed, may overflow horizontally |
+| No recent files | Hide RecentFilesList section |
+| File parse in progress | Show LoadingState, disable interactions |
+| Parse error | Show ErrorState with dismiss button |
+| Font size at limits | Disable increase/decrease button appropriately |
+| Word highlight while scrolling | Debounce scroll-triggered highlight updates |
+| Rapid view toggling | Debounce toggle events (100ms minimum) |
+
+#### 10.2 View Toggle Debouncing
+
+```typescript
+// Prevent rapid view toggling that could cause issues
+
+let lastToggleTime = 0;
+const TOGGLE_DEBOUNCE_MS = 100;
+
+function debouncedViewToggle(): void {
+  const now = Date.now();
+  if (now - lastToggleTime < TOGGLE_DEBOUNCE_MS) {
+    return;
+  }
+  lastToggleTime = now;
+
+  handleViewToggle();
+}
+```
+
+#### 10.3 Scroll Throttling
+
+```typescript
+// Throttle scroll-based highlight updates in Reader View
+
+let scrollRAF: number | null = null;
+
+function handleScroll(): void {
+  if (scrollRAF) return;
+
+  scrollRAF = requestAnimationFrame(() => {
+    scrollRAF = null;
+    updateVisibleHighlight();
+  });
+}
+```
+
+---
+
+### 11. Accessibility
+
+#### 11.1 Keyboard Navigation
+
+| Key | Action | Context |
+|-----|--------|---------|
+| Tab | Toggle between views | Global |
+| Space | Play/pause | Global |
+| Arrow keys | Navigate words in Reader | Reader View |
+| +/- | Font size | Reader View |
+| Enter | Activate focused word | Reader View |
+
+#### 11.2 ARIA Attributes
+
+```svelte
+<!-- SpeedView word display -->
+<div
+  role="region"
+  aria-label="Speed reading display"
+  aria-live="polite"
+>
+  <span aria-label="Current word: {word.text}">
+    {word.text}
+  </span>
+</div>
+
+<!-- Reader View clickable word -->
+<span
+  role="button"
+  tabindex="0"
+  aria-label="Set reading position to: {word.text}"
+>
+  {word.text}
+</span>
+
+<!-- Progress indicator -->
+<div
+  role="status"
+  aria-live="polite"
+  aria-label="Reading progress: {progress}%, {timeRemaining} remaining"
+>
+  ...
+</div>
+```
+
+#### 11.3 Focus Management
+
+```typescript
+// When switching views, manage focus appropriately
+
+function handleViewSwitch(newView: 'speed' | 'reader'): void {
+  if (newView === 'speed') {
+    // Focus the speed view container
+    document.querySelector('.speed-view')?.focus();
+  } else {
+    // Focus the reader view, optionally at highlighted word
+    const highlighted = document.querySelector('.clickable-word.highlighted');
+    if (highlighted) {
+      (highlighted as HTMLElement).focus();
+    } else {
+      document.querySelector('.reader-view')?.focus();
+    }
+  }
+}
+```
+
+---
+
+### 12. File Structure Summary
+
+```
+src/lib/
+├── components/
+│   ├── views/
+│   │   ├── ViewContainer.svelte      # Main orchestrator
+│   │   ├── SpeedView.svelte          # RSVP display
+│   │   ├── ReaderView.svelte         # Document view
+│   │   ├── EmptyState.svelte         # No document state
+│   │   ├── LoadingState.svelte       # Parsing state
+│   │   └── ErrorState.svelte         # Error display
+│   ├── speed/
+│   │   ├── WordDisplay.svelte        # Word wrapper
+│   │   ├── ORPRenderer.svelte        # ORP positioning
+│   │   ├── ProgressOverlay.svelte    # Progress when paused
+│   │   └── SpeedControls.svelte      # WPM controls
+│   ├── reader/
+│   │   ├── DocumentRenderer.svelte   # Document layout
+│   │   ├── ParagraphBlock.svelte     # Paragraph display
+│   │   ├── ClickableWord.svelte      # Interactive word
+│   │   ├── ImageBlock.svelte         # Inline images
+│   │   └── FontSizeControls.svelte   # +/- size
+│   └── empty/
+│       ├── RecentFilesList.svelte    # Recent files
+│       ├── FileDropZone.svelte       # Drag and drop
+│       └── FilePicker.svelte         # File button
+├── stores/
+│   ├── viewStore.ts                  # View state
+│   └── uiStore.ts                    # UI state
+└── view/
+    ├── viewSync.ts                   # View synchronization
+    └── viewIntegration.ts            # Playback integration
+```
+
+---
+
+## Review
+*To be filled by Judge agent*
